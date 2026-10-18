@@ -43,7 +43,7 @@ INCOME_CATEGORIES = [
 ]
 MAIN_TYPES = ["支出", "收入", "刷卡"]
 
-HEADERS = ["日期", "時間", "傳送者", "大項目", "項目", "金額", "小項目", "原始訊息"]
+HEADERS = ["日期", "時間", "傳送者", "收支", "項目", "內容", "金額", "備註"]
 
 
 def now_tw():
@@ -51,7 +51,7 @@ def now_tw():
 
 
 def get_sheet():
-    """連接試算表；若是舊版七欄格式，會自動轉成新版八欄格式並保留舊資料。"""
+    """連接試算表；將舊欄位轉成新欄位並保留既有記帳資料。"""
     if not GOOGLE_CREDENTIALS_JSON:
         raise RuntimeError("Render 尚未設定 GOOGLE_CREDENTIALS_JSON")
     if not GOOGLE_SHEET_ID:
@@ -77,22 +77,27 @@ def get_sheet():
 
     if values[0] != HEADERS:
         old_headers = values[0]
-        # 舊版欄位：日期、時間、傳送者、項目、金額、類別、原始訊息
         old_rows = values[1:]
-        if old_headers[:7] == ["日期", "時間", "傳送者", "項目", "金額", "類別", "原始訊息"]:
-            converted = [HEADERS]
+        converted = [HEADERS]
+        if old_headers[:8] == ["日期", "時間", "傳送者", "大項目", "項目", "金額", "小項目", "原始訊息"]:
+            # 先前八欄版本：大項目→收支、小項目→項目、項目→內容；不保留原始訊息。
+            for row in old_rows:
+                row = row + [""] * max(0, 8 - len(row))
+                converted.append([row[0], row[1], row[2], row[3], row[6], row[4], row[5], ""])
+        elif old_headers[:7] == ["日期", "時間", "傳送者", "項目", "金額", "類別", "原始訊息"]:
+            # 更早的七欄版本。
             for row in old_rows:
                 row = row + [""] * max(0, 7 - len(row))
-                converted.append([
-                    row[0], row[1], row[2], "支出", row[3], row[4], row[5], row[6]
-                ])
-            ws.clear()
-            ws.update("A1", converted)
+                converted.append([row[0], row[1], row[2], "支出", row[5], row[3], row[4], ""])
+        elif old_headers[:8] == HEADERS:
+            return ws
         else:
             # 不認得的表頭不自動清除，避免意外覆蓋使用者資料。
             raise RuntimeError(
                 "「記帳」工作表的第一列欄位與程式不一致。請先備份試算表，再確認第一列欄名。"
             )
+        ws.clear()
+        ws.update("A1", converted)
     return ws
 
 
@@ -312,6 +317,44 @@ def reply_message(reply_token, text):
         sys.stdout.write(f"[LINE] 回覆錯誤：{e}\n")
 
 
+
+# LINE 使用者名稱快取；試算表顯示 LINE 名稱，不顯示 U 開頭的 userId。
+_SENDER_NAME_CACHE = {}
+
+def get_sender_name(user_id, source):
+    if not user_id:
+        return "未知使用者"
+    if user_id in _SENDER_NAME_CACHE:
+        return _SENDER_NAME_CACHE[user_id]
+    if not LINE_CHANNEL_ACCESS_TOKEN:
+        return "未知使用者"
+
+    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+    source_type = (source or {}).get("type", "")
+    group_id = (source or {}).get("groupId", "")
+    room_id = (source or {}).get("roomId", "")
+    urls = []
+    if source_type == "group" and group_id:
+        urls.append(f"https://api.line.me/v2/bot/group/{group_id}/member/{user_id}")
+    elif source_type == "room" and room_id:
+        urls.append(f"https://api.line.me/v2/bot/room/{room_id}/member/{user_id}")
+    urls.append(f"https://api.line.me/v2/bot/profile/{user_id}")
+
+    for url in urls:
+        try:
+            response = req.get(url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                display_name = str(response.json().get("displayName", "")).strip()
+                if display_name:
+                    _SENDER_NAME_CACHE[user_id] = display_name
+                    return display_name
+        except Exception as e:
+            sys.stdout.write(f"[LINE PROFILE] 取得名稱失敗：{e}\n")
+
+    # 若 LINE API 無法取得顯示名稱，不把 Uxxxx ID 寫進表格。
+    return "未知使用者"
+
+
 def get_records():
     ws = get_sheet()
     rows = ws.get_all_records()
@@ -320,7 +363,7 @@ def get_records():
         try:
             amount = int(str(row.get("金額", 0)).replace(",", ""))
             date_str = str(row.get("日期", "")).strip()
-            main_type = str(row.get("大項目", "支出")).strip() or "支出"
+            main_type = str(row.get("收支", "支出")).strip() or "支出"
             if main_type not in MAIN_TYPES:
                 main_type = "支出"
             result.append({
@@ -328,10 +371,10 @@ def get_records():
                 "時間": str(row.get("時間", "")),
                 "傳送者": str(row.get("傳送者", "未知")),
                 "大項目": main_type,
-                "項目": str(row.get("項目", "")),
+                "項目": str(row.get("內容", "")),
                 "金額": amount,
-                "小項目": str(row.get("小項目", "其他")) or "其他",
-                "原始訊息": str(row.get("原始訊息", "")),
+                "小項目": str(row.get("項目", "其他")) or "其他",
+                "備註": str(row.get("備註", "")),
             })
         except (ValueError, TypeError):
             continue
@@ -357,7 +400,7 @@ def save_record(sender, original_text, record):
     current_time = now_tw().strftime("%H:%M")
     ws.append_row([
         record["date"], current_time, sender, record["main_type"],
-        record["item"], record["amount"], record["category"], original_text
+        record["category"], record["item"], record["amount"], ""
     ], value_input_option="USER_ENTERED")
 
 
@@ -429,9 +472,9 @@ def delete_latest_record(sender):
         row = rows[index]
         if str(row.get(sender_col, "")) == str(sender):
             sheet_row_number = index + 2  # 第 1 列是欄名，資料從第 2 列開始
-            item = str(row.get("項目", "未命名項目"))
+            item = str(row.get("內容", "未命名項目"))
             amount = str(row.get("金額", "0"))
-            main_type = str(row.get("大項目", "支出"))
+            main_type = str(row.get("收支", "支出"))
             ws.delete_rows(sheet_row_number)
             return f"🗑️ 已刪除上一筆：{main_type}｜{item} ${amount}"
     return "目前找不到你新增的記帳資料。"
@@ -466,7 +509,9 @@ def handle_event(event):
 
     text = msg.get("text", "").strip()
     reply_token = event.get("replyToken", "")
-    sender = event.get("source", {}).get("userId", "未知")
+    source = event.get("source", {})
+    sender_id = source.get("userId", "")
+    sender = get_sender_name(sender_id, source)
     sys.stdout.write(f"[MSG] {text!r} from {sender}\n")
 
     commands = {
