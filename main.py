@@ -134,8 +134,11 @@ def init_db():
             token TEXT PRIMARY KEY,
             line_user_id TEXT NOT NULL,
             expires_at INTEGER NOT NULL,
-            used INTEGER NOT NULL DEFAULT 0
+            used INTEGER NOT NULL DEFAULT 0,
+            group_id TEXT
         )""")
+        conn.execute("ALTER TABLE link_tokens ADD COLUMN IF NOT EXISTS group_id TEXT")
+        conn.execute("ALTER TABLE oauth_sessions ADD COLUMN IF NOT EXISTS group_id TEXT")
         conn.execute("""CREATE TABLE IF NOT EXISTS user_settings (
             line_user_id TEXT PRIMARY KEY,
             wallet_balance INTEGER NOT NULL DEFAULT 0,
@@ -206,44 +209,45 @@ def get_sheet(line_user_id):
     return ws
 
 
-def create_link_token(line_user_id):
+def create_link_token(line_user_id, group_id=""):
     token = secrets.token_urlsafe(32)
     now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
     with db_connect() as conn:
-        conn.execute("INSERT INTO link_tokens(token,line_user_id,expires_at,used) VALUES(?,?,?,0)",
-                     (token, line_user_id, now + 600))
+        conn.execute("INSERT INTO link_tokens(token,line_user_id,expires_at,used,group_id) VALUES(?,?,?,0,?)",
+                     (token, line_user_id, now + 600, group_id or None))
     return token
 
 
 def consume_link_token(token):
     now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
     with db_connect() as conn:
-        row = conn.execute("SELECT line_user_id,expires_at,used FROM link_tokens WHERE token=?", (token,)).fetchone()
+        row = conn.execute("SELECT line_user_id,expires_at,used,group_id FROM link_tokens WHERE token=?", (token,)).fetchone()
         if not row or row["used"] or row["expires_at"] < now:
             return None
         conn.execute("UPDATE link_tokens SET used=1 WHERE token=?", (token,))
-        return row["line_user_id"]
+        return {"line_user_id": row["line_user_id"], "group_id": row.get("group_id") or ""}
 
 
-def save_oauth_session(state, line_user_id, code_verifier):
-    """保存每次 OAuth 流程的使用者與 PKCE verifier，供 callback 使用。"""
+def save_oauth_session(state, line_user_id, code_verifier, group_id=""):
+    """保存使用者、原群組與 PKCE verifier，授權完成後送回原群組。"""
     now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
     with db_connect() as conn:
-        conn.execute("""INSERT INTO oauth_sessions(state,line_user_id,created_at,code_verifier)
-                     VALUES(?,?,?,?)
+        conn.execute("""INSERT INTO oauth_sessions(state,line_user_id,created_at,code_verifier,group_id)
+                     VALUES(?,?,?,?,?)
                      ON CONFLICT(state) DO UPDATE SET line_user_id=EXCLUDED.line_user_id,
-                     created_at=EXCLUDED.created_at, code_verifier=EXCLUDED.code_verifier""",
-                     (state, line_user_id, now, code_verifier))
+                     created_at=EXCLUDED.created_at, code_verifier=EXCLUDED.code_verifier,
+                     group_id=EXCLUDED.group_id""",
+                     (state, line_user_id, now, code_verifier, group_id or None))
 
 
 def consume_oauth_session(state):
     now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
     with db_connect() as conn:
-        row = conn.execute("SELECT line_user_id,created_at,code_verifier FROM oauth_sessions WHERE state=?", (state,)).fetchone()
+        row = conn.execute("SELECT line_user_id,created_at,code_verifier,group_id FROM oauth_sessions WHERE state=?", (state,)).fetchone()
         conn.execute("DELETE FROM oauth_sessions WHERE state=?", (state,))
         if not row or now - int(row["created_at"]) > 600:
             return None
-        return {"line_user_id": row["line_user_id"], "code_verifier": row["code_verifier"]}
+        return {"line_user_id": row["line_user_id"], "code_verifier": row["code_verifier"], "group_id": row.get("group_id") or ""}
 
 
 def create_user_spreadsheet(creds, line_user_id):
@@ -840,7 +844,7 @@ HELP_MESSAGE = """📖 記帳小工具｜使用說明 💚
 
 📊 三、小工具指令
 • 帳本：取得自己的 Google 試算表連結
-• 查詢今日/本週/本月/上個月/今年：看指定期間內收支與刷卡明細
+• 今日/本週/本月/上個月/今年：看指定期間內收支與刷卡明細
 • 統計：查看累積收入、累積支出、目前餘額及本期已刷金額（若無初始設定餘額，已使用情況統計）
 • 說明：查看記帳小工具完整使用方式
 • 刪除：刪除自己最近一筆記帳
@@ -879,7 +883,7 @@ def handle_event(event):
             if not line_user_id:
                 reply_message(reply_token, "⚠️ 無法辨識你的 LINE 帳號，請在群組內重新點選。")
                 return
-            token = create_link_token(line_user_id)
+            token = create_link_token(line_user_id, source.get("groupId", "") if source.get("type") == "group" else "")
             link_url = f"{BASE_URL}/auth/start?link_token={quote(token)}"
             reply_messages(reply_token, [link_google_flex_message(link_url)])
         return
@@ -897,7 +901,7 @@ def handle_event(event):
     sys.stdout.write(f"[MSG] {text!r} from {sender}\n")
 
     if text in ["連結 Google 帳號", "連結Google", "Google連結", "重新連結 Google 帳號"]:
-        token = create_link_token(line_user_id)
+        token = create_link_token(line_user_id, source.get("groupId", "") if source.get("type") == "group" else "")
         link_url = f"{BASE_URL}/auth/start?link_token={quote(token)}"
         reply_messages(reply_token, [link_google_flex_message(link_url)])
         return
@@ -908,7 +912,7 @@ def handle_event(event):
 
     # 查詢、刪除與記帳都限定在目前 LINE 使用者自己的試算表。
     if not user_is_linked(line_user_id):
-        token = create_link_token(line_user_id)
+        token = create_link_token(line_user_id, source.get("groupId", "") if source.get("type") == "group" else "")
         link_url = f"{BASE_URL}/auth/start?link_token={quote(token)}"
         reply_messages(reply_token, [link_google_flex_message(link_url)])
         return
@@ -936,7 +940,7 @@ def handle_event(event):
             user_row = get_user_row(line_user_id)
             if not user_row:
                 # 防止使用者尚未完成連結時落入此分支：建立本人專屬的一次性 OAuth 連結。
-                token = create_link_token(line_user_id)
+                token = create_link_token(line_user_id, source.get("groupId", "") if source.get("type") == "group" else "")
                 link_url = f"{BASE_URL}/auth/start?link_token={quote(token)}"
                 reply_messages(reply_token, [link_google_flex_message(link_url)])
                 return
@@ -1009,9 +1013,11 @@ init_db()
 @app.route("/auth/start", methods=["GET"])
 def auth_start():
     link_token = request.args.get("link_token", "")
-    line_user_id = consume_link_token(link_token)
-    if not line_user_id:
+    link_session = consume_link_token(link_token)
+    if not link_session:
         return "連結已過期或已使用。請回到 LINE 群組，重新點選「連結 Google 帳號」。", 400
+    line_user_id = link_session["line_user_id"]
+    group_id = link_session.get("group_id", "")
     try:
         flow = Flow.from_client_config(
             oauth_client_config(), scopes=GOOGLE_SCOPES,
@@ -1020,7 +1026,7 @@ def auth_start():
         auth_url, state = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent")
         # google-auth-oauthlib 會在 PKCE 流程產生 code_verifier；必須與 state 一起保存，
         # callback 重新建立 Flow 時再取回，否則會出現 invalid_grant: Missing code verifier。
-        save_oauth_session(state, line_user_id, getattr(flow, "code_verifier", None))
+        save_oauth_session(state, line_user_id, getattr(flow, "code_verifier", None), group_id)
         return __import__("flask").redirect(auth_url)
     except Exception as e:
         sys.stdout.write(f"[OAUTH] 建立授權網址失敗：{e}\n")
@@ -1037,6 +1043,7 @@ def auth_callback():
     if not oauth_session:
         return "授權連結已過期，請回到 LINE 重新點選「連結 Google 帳號」。", 400
     line_user_id = oauth_session["line_user_id"]
+    group_id = oauth_session.get("group_id", "")
     code_verifier = oauth_session.get("code_verifier")
     if not code_verifier:
         sys.stdout.write("[OAUTH] 缺少已保存的 PKCE code_verifier，請重新開始授權。\n")
@@ -1050,13 +1057,16 @@ def auth_callback():
         flow.fetch_token(code=code)
         creds = flow.credentials
         spreadsheet_url = create_user_spreadsheet(creds, line_user_id)
-        # 不使用私訊功能；授權成功頁面直接顯示歡迎與初始設定提示。
-        welcome_html = WELCOME_MESSAGE.replace("\n", "<br>")
+        # 授權完成後，把歡迎詞送回發起連結的原群組；不向使用者私訊。
+        group_sent = False
+        if group_id:
+            group_sent = push_messages(group_id, [{"type": "text", "text": chunk} for chunk in split_line_text(WELCOME_MESSAGE)])
+        welcome_status = "歡迎詞已送回原本的 LINE 群組。" if group_sent else "歡迎詞未能送回群組；請回到原群組重新操作。"
         return ("<html><meta charset='utf-8'><body style='font-family:sans-serif;padding:24px;line-height:1.8'>"
                 "<h2>✅ Google 帳號連結成功！</h2>"
-                f"<p>{welcome_html}</p>"
+                f"<p>{welcome_status}</p>"
                 f"<p><a href='{spreadsheet_url}' target='_blank' rel='noopener'>開啟我的 Google 試算表</a></p>"
-                "<p>接著回到 LINE 群組，就可以開始記帳。</p>"
+                "<p>請回到 LINE 群組繼續使用記帳小工具。</p>"
                 "</body></html>")
     except Exception as e:
         sys.stdout.write(f"[OAUTH] 授權完成但建立試算表失敗：{e}\n")
