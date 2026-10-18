@@ -686,60 +686,31 @@ def cycle_start(today, statement_day):
 
 
 def query_people_stats(line_user_id):
-    """顯示個人累積收支、初始餘額可選，以及本期刷卡金額。"""
+    """只顯示累積收入、累積支出、餘額與本期刷卡。"""
     try:
         records = get_records(line_user_id)
         settings = get_settings(line_user_id)
     except Exception as e:
         return f"📭 無法連接你的試算表：{str(e)[:180]}"
 
-    total_income = sum(r["金額"] for r in records if r["大項目"] == "收入")
+    # 初始錢包與帳戶餘額都算入「累積收入」，但不會算成本月收入。
+    wallet_initial = int(settings.get("wallet_balance", 0) or 0)
+    account_initial = int(settings.get("account_balance", 0) or 0)
+    recorded_income = sum(r["金額"] for r in records if r["大項目"] == "收入")
+    total_income = wallet_initial + account_initial + recorded_income
     total_expense = sum(r["金額"] for r in records if r["大項目"] == "支出")
-    wallet_set = bool(settings.get("wallet_balance_set", False))
-    account_set = bool(settings.get("account_balance_set", False))
-    wallet = int(settings["wallet_balance"])
-    account = int(settings["account_balance"])
-
-    # Initial balances are optional. If a balance wasn't configured, show recorded
-    # activity only instead of presenting a made-up real-world balance.
-    cash_expenses = 0
-    bank_expenses = 0
-    for r in records:
-        if r["大項目"] == "支出":
-            if r.get("付款方式") == "cash":
-                cash_expenses += r["金額"]
-            else:
-                bank_expenses += r["金額"]
-        elif r["大項目"] == "收入":
-            account += r["金額"]
-    wallet -= cash_expenses
-    account -= bank_expenses
+    balance = total_income - total_expense
 
     today = now_tw().date()
     start = cycle_start(today, int(settings["statement_day"]))
     card_total = sum(r["金額"] for r in records if r["大項目"] == "刷卡"
                      and start.isoformat() <= r["日期"] <= today.isoformat())
 
-    lines = [
-        "📊 個人財務統計", "",
-        f"💵 累積收入：${total_income:,}",
-        f"💸 累積支出：${total_expense:,}",
-    ]
-    if wallet_set or account_set:
-        lines.append(f"👛 目前錢包現金：${wallet:,}" if wallet_set else "👛 錢包現金：未設定初始餘額（僅統計記帳情況）")
-        lines.append(f"🏦 目前銀行帳戶：${account:,}" if account_set else "🏦 銀行帳戶：未設定初始餘額（僅統計記帳情況）")
-    else:
-        net_activity = total_income - total_expense
-        lines.extend([
-            "💰 尚未設定初始錢包／帳戶餘額，以下為已記帳情況統計。",
-            f"📈 收入與支出差額：${net_activity:,}",
-        ])
-    lines.extend([
-        f"💳 本期已刷（{start.strftime('%m/%d')}～{today.strftime('%m/%d')}）：${card_total:,}",
-        "",
-        "📌 一般支出預設從銀行帳戶扣除；輸入「現金 午餐 100」可從錢包現金扣除。",
-    ])
-    return "\n".join(lines)
+    return ("📊 個人財務統計\n\n"
+            f"💰 累積收入：${total_income:,}\n"
+            f"💸 累積支出：${total_expense:,}\n"
+            f"💵 餘額：${balance:,}\n"
+            f"💳 本期已刷：${card_total:,}")
 
 
 def flex_button(label, action):
@@ -844,8 +815,8 @@ HELP_MESSAGE = """📖 記帳小工具｜使用說明 💚
 
 📊 三、小工具指令
 • 帳本：取得自己的 Google 試算表連結
-• 今日/本週/本月/上個月/今年：看指定期間內收支與刷卡明細
-• 統計：查看累積收入、累積支出、目前餘額及本期已刷金額（若無初始設定餘額，已使用情況統計）
+• 查詢今日/本週/本月/上個月/今年：看指定期間內收支與刷卡明細
+• 統計：查看累積收入、累積支出、餘額及本期已刷金額
 • 說明：查看記帳小工具完整使用方式
 • 刪除：刪除自己最近一筆記帳
 
@@ -929,10 +900,10 @@ def handle_event(event):
             respond_personal_text(reply_token, line_user_id, source, f"✅ 信用卡結算日已設定為每月 {value} 日。")
         elif setting_name == "錢包餘額":
             set_setting(line_user_id, "wallet_balance", value)
-            respond_personal_text(reply_token, line_user_id, source, f"✅ 初始錢包餘額已設定為 ${value:,}。這筆不會算成收入。")
+            respond_personal_text(reply_token, line_user_id, source, f"✅ 錢包餘額 ${value:,}。")
         else:
             set_setting(line_user_id, "account_balance", value)
-            respond_personal_text(reply_token, line_user_id, source, f"✅ 初始帳戶餘額已設定為 ${value:,}。這筆不會算成收入。")
+            respond_personal_text(reply_token, line_user_id, source, f"✅ 帳戶餘額 ${value:,}。")
         return
 
     if text == "帳本":
@@ -983,13 +954,8 @@ def handle_event(event):
         return
 
     payment_method = "bank"
-    parse_text = text
-    if re.match(r"^現金(?:\s|[:：])", parse_text):
-        payment_method = "cash"
-        parse_text = re.sub(r"^現金\s*[:：]?\s*", "", parse_text)
-    elif re.match(r"^(金融卡|帳戶|銀行帳戶)(?:\s|[:：])", parse_text):
-        payment_method = "bank"
-        parse_text = re.sub(r"^(金融卡|帳戶|銀行帳戶)\s*[:：]?\s*", "", parse_text)
+    # 一般支出不要求指定現金或金融卡，統一視為「支出」。
+    parse_text = re.sub(r"^(金融卡|帳戶|銀行帳戶|現金)\s*[:：]?\s*", "", text)
     record = parse_record(parse_text)
     if not record:
         return
@@ -1056,18 +1022,14 @@ def auth_callback():
         flow.code_verifier = code_verifier
         flow.fetch_token(code=code)
         creds = flow.credentials
-        spreadsheet_url = create_user_spreadsheet(creds, line_user_id)
-        # 授權完成後，把歡迎詞送回發起連結的原群組；不向使用者私訊。
-        group_sent = False
+        create_user_spreadsheet(creds, line_user_id)
+        # 歡迎詞只送回發起授權的原 LINE 群組，不私訊，也不把文案留在網頁上。
         if group_id:
-            group_sent = push_messages(group_id, [{"type": "text", "text": chunk} for chunk in split_line_text(WELCOME_MESSAGE)])
-        welcome_status = "歡迎詞已送回原本的 LINE 群組。" if group_sent else "歡迎詞未能送回群組；請回到原群組重新操作。"
-        return ("<html><meta charset='utf-8'><body style='font-family:sans-serif;padding:24px;line-height:1.8'>"
-                "<h2>✅ Google 帳號連結成功！</h2>"
-                f"<p>{welcome_status}</p>"
-                f"<p><a href='{spreadsheet_url}' target='_blank' rel='noopener'>開啟我的 Google 試算表</a></p>"
-                "<p>請回到 LINE 群組繼續使用記帳小工具。</p>"
-                "</body></html>")
+            welcome_messages = [{"type": "text", "text": chunk}
+                                for chunk in split_line_text(WELCOME_MESSAGE)]
+            push_messages(group_id, welcome_messages)
+        # OAuth callback 不顯示多餘成功頁，完成後直接嘗試開啟 LINE。
+        return __import__("flask").redirect("https://line.me/R/", code=302)
     except Exception as e:
         sys.stdout.write(f"[OAUTH] 授權完成但建立試算表失敗：{e}\n")
         return "Google 授權完成，但建立試算表失敗。請稍後回到 LINE 重新連結，並確認已啟用 Google Drive API 與 Google Sheets API。", 500
