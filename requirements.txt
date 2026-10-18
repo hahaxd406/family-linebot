@@ -4,3 +4,5 @@ gspread>=6.0,<7.0
 google-auth>=2.30,<3.0
 google-auth-oauthlib>=1.2,<2.0
 openai>=1.30,<3.0
+psycopg[binary]>=3.2,<4.0
+
