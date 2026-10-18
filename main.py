@@ -122,19 +122,14 @@ def init_db():
             spreadsheet_id TEXT NOT NULL,
             linked_at TEXT NOT NULL
         )""")
-        
-conn.execute("""CREATE TABLE IF NOT EXISTS oauth_sessions (
-    state TEXT PRIMARY KEY,
-    line_user_id TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    code_verifier TEXT
-)""")
-
-conn.execute("""
-    ALTER TABLE oauth_sessions
-    ADD COLUMN IF NOT EXISTS code_verifier TEXT
-""")
-
+        conn.execute("""CREATE TABLE IF NOT EXISTS oauth_sessions (
+            state TEXT PRIMARY KEY,
+            line_user_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            code_verifier TEXT
+        )""")
+        # 相容已存在的 Neon/PostgreSQL 資料表，新增 PKCE 所需欄位。
+        conn.execute("ALTER TABLE oauth_sessions ADD COLUMN IF NOT EXISTS code_verifier TEXT")
         conn.execute("""CREATE TABLE IF NOT EXISTS link_tokens (
             token TEXT PRIMARY KEY,
             line_user_id TEXT NOT NULL,
@@ -230,22 +225,25 @@ def consume_link_token(token):
         return row["line_user_id"]
 
 
-def save_oauth_session(state, line_user_id):
+def save_oauth_session(state, line_user_id, code_verifier):
+    """保存每次 OAuth 流程的使用者與 PKCE verifier，供 callback 使用。"""
     now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
     with db_connect() as conn:
-        conn.execute("""INSERT INTO oauth_sessions(state,line_user_id,created_at) VALUES(?,?,?)
+        conn.execute("""INSERT INTO oauth_sessions(state,line_user_id,created_at,code_verifier)
+                     VALUES(?,?,?,?)
                      ON CONFLICT(state) DO UPDATE SET line_user_id=EXCLUDED.line_user_id,
-                     created_at=EXCLUDED.created_at""", (state, line_user_id, now))
+                     created_at=EXCLUDED.created_at, code_verifier=EXCLUDED.code_verifier""",
+                     (state, line_user_id, now, code_verifier))
 
 
 def consume_oauth_session(state):
     now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
     with db_connect() as conn:
-        row = conn.execute("SELECT line_user_id,created_at FROM oauth_sessions WHERE state=?", (state,)).fetchone()
+        row = conn.execute("SELECT line_user_id,created_at,code_verifier FROM oauth_sessions WHERE state=?", (state,)).fetchone()
         conn.execute("DELETE FROM oauth_sessions WHERE state=?", (state,))
         if not row or now - int(row["created_at"]) > 600:
             return None
-        return row["line_user_id"]
+        return {"line_user_id": row["line_user_id"], "code_verifier": row["code_verifier"]}
 
 
 def create_user_spreadsheet(creds, line_user_id):
@@ -1015,9 +1013,14 @@ def auth_start():
     if not line_user_id:
         return "連結已過期或已使用。請回到 LINE 群組，重新點選「連結 Google 帳號」。", 400
     try:
-        flow = Flow.from_client_config(oauth_client_config(), scopes=GOOGLE_SCOPES, redirect_uri=OAUTH_REDIRECT_URI)
+        flow = Flow.from_client_config(
+            oauth_client_config(), scopes=GOOGLE_SCOPES,
+            redirect_uri=OAUTH_REDIRECT_URI, autogenerate_code_verifier=True
+        )
         auth_url, state = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent")
-        save_oauth_session(state, line_user_id)
+        # google-auth-oauthlib 會在 PKCE 流程產生 code_verifier；必須與 state 一起保存，
+        # callback 重新建立 Flow 時再取回，否則會出現 invalid_grant: Missing code verifier。
+        save_oauth_session(state, line_user_id, getattr(flow, "code_verifier", None))
         return __import__("flask").redirect(auth_url)
     except Exception as e:
         sys.stdout.write(f"[OAUTH] 建立授權網址失敗：{e}\n")
@@ -1028,16 +1031,22 @@ def auth_start():
 def auth_callback():
     error = request.args.get("error")
     state = request.args.get("state", "")
-    line_user_id = consume_oauth_session(state)
+    oauth_session = consume_oauth_session(state)
     if error:
         return "你取消了 Google 授權。請回到 LINE 重新點選「連結 Google 帳號」。", 400
-    if not line_user_id:
+    if not oauth_session:
         return "授權連結已過期，請回到 LINE 重新點選「連結 Google 帳號」。", 400
+    line_user_id = oauth_session["line_user_id"]
+    code_verifier = oauth_session.get("code_verifier")
+    if not code_verifier:
+        sys.stdout.write("[OAUTH] 缺少已保存的 PKCE code_verifier，請重新開始授權。\n")
+        return "這次授權流程資料不完整，請回到 LINE 重新點選「連結 Google 帳號」。", 400
     code = request.args.get("code", "")
     if not code:
         return "Google 沒有回傳授權碼，請重新操作。", 400
     try:
         flow = Flow.from_client_config(oauth_client_config(), scopes=GOOGLE_SCOPES, state=state, redirect_uri=OAUTH_REDIRECT_URI)
+        flow.code_verifier = code_verifier
         flow.fetch_token(code=code)
         creds = flow.credentials
         spreadsheet_url = create_user_spreadsheet(creds, line_user_id)
