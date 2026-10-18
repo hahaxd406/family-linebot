@@ -1106,7 +1106,34 @@ def callback():
 
 @app.route("/", methods=["GET"])
 def health():
-    return "✅ 記帳小工具運作中"
+    # 公開的應用程式首頁，供使用者與 Google OAuth 品牌設定查看。
+    return """<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>記帳小工具</title>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,'Noto Sans TC',sans-serif;max-width:760px;margin:48px auto;padding:0 20px;line-height:1.8;color:#263238}h1{color:#087f75}a{color:#087f75}main{background:#f5fbfa;padding:24px;border-radius:16px}</style></head>
+<body><main><h1>💚 記帳小工具</h1><p>記帳小工具協助使用者記錄日常收入、支出、信用卡消費及貸款繳費，並查看不同期間的收支統計。</p>
+<p>使用者可透過 Google 帳號授權，讓服務建立及操作個人 Google 試算表，以保存記帳資料。</p>
+<p><a href="/privacy">查看隱私權政策</a></p></main></body></html>""", 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@app.route("/privacy", methods=["GET"])
+def privacy_policy():
+    # 公開隱私權政策頁面。聯絡方式使用服務用途描述，不虛構電子郵件地址。
+    return """<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>隱私權政策｜記帳小工具</title>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,'Noto Sans TC',sans-serif;max-width:820px;margin:40px auto;padding:0 20px;line-height:1.85;color:#263238}h1,h2{color:#087f75}a{color:#087f75}</style></head>
+<body><h1>隱私權政策｜記帳小工具</h1><p>最後更新日期：2026 年 10 月 19 日</p>
+<p>記帳小工具提供個人收支記錄與統計功能。本政策說明服務在使用者授權後，如何存取、使用及保護相關資料。</p>
+<h2>一、收集與處理的資料</h2><p>本服務會處理使用者在 LINE 中提交的記帳內容、使用者識別所需的 LINE 使用者識別碼，以及完成 Google 授權後取得的必要授權憑證與 Google 試算表識別資訊。實際處理範圍以使用者使用的功能及授權畫面所列權限為準。</p>
+<h2>二、資料用途</h2><p>資料僅用於辨識使用者、完成 Google 帳號連結、建立或更新個人記帳試算表、提供記帳指令及收支統計，以及維護服務正常運作。</p>
+<h2>三、資料儲存與分享</h2><p>記帳資料會儲存在使用者自己的 Google 試算表；服務運作所需的帳號對應資訊、設定及必要授權資料會儲存在服務使用的資料庫中。資料可能由 Google、LINE 及本服務所使用的託管服務依各自的隱私權政策處理。本服務不會為廣告目的出售使用者的個人資料。</p>
+<h2>四、Google 帳號權限</h2><p>使用者可自行決定是否授權 Google 帳號。使用者可前往 Google 帳號的第三方連結管理頁面撤銷授權；撤銷後，依賴該授權的記帳功能可能無法繼續使用。撤銷授權不會自動刪除已存在於使用者 Google 試算表中的資料。</p>
+<h2>五、資料安全與保存</h2><p>本服務採取合理措施限制資料用途並保護服務所處理的資料。資料會在提供服務所需期間內保存；若要要求刪除服務資料或詢問資料處理方式，請透過提供本記帳小工具的 LINE 官方帳號或服務管理者聯絡。</p>
+<h2>六、兒童隱私</h2><p>本服務並非專為兒童設計。如監護人認為兒童提供了不適當的個人資料，請透過提供本服務的 LINE 官方帳號聯絡管理者。</p>
+<h2>七、政策更新</h2><p>本政策可能因服務功能或法律要求調整；更新版本會發布於本頁。</p>
+<h2>八、聯絡方式</h2><p>如對本政策或個人資料處理有疑問，請透過提供記帳小工具的 LINE 官方帳號聯絡服務管理者。</p>
+<p><a href="/">返回記帳小工具首頁</a></p></body></html>""", 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
 if __name__ == "__main__":
