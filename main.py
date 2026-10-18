@@ -9,11 +9,15 @@ import base64
 import hashlib
 import datetime
 import threading
+import sqlite3
+import secrets
+from urllib.parse import quote
 
 import requests as req
 import gspread
 from flask import Flask, request
-from google.oauth2.service_account import Credentials
+from google.oauth2.credentials import Credentials as UserCredentials
+from google_auth_oauthlib.flow import Flow
 from openai import OpenAI
 
 app = Flask(__name__)
@@ -23,18 +27,26 @@ LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
-GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
+GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")  # 舊版相容保留，不再用於個人試算表
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+BASE_URL = os.environ.get("BASE_URL", "https://family-linebot-mv4v.onrender.com").rstrip("/")
+OAUTH_REDIRECT_URI = os.environ.get("OAUTH_REDIRECT_URI", f"{BASE_URL}/auth/callback")
+DB_PATH = os.environ.get("DB_PATH", "/var/data/record_bot.sqlite3")
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 TW = datetime.timezone(datetime.timedelta(hours=8))
 
 # ===== 大項目與小項目 =====
-# 支出保留原本的小項目，另外新增「交卡費」。
-# 刷卡的小項目與支出完全相同（包含「交卡費」）。
+# 支出與刷卡使用相同的小項目；繳卡費屬於實際支出。
 EXPENSE_CATEGORIES = [
     "餐飲", "交通", "生活", "醫療健康", "美容保養", "服飾",
     "訂閱服務", "娛樂休閒", "運動健身", "旅遊", "教育", "保險",
-    "稅費", "捐款公益", "其他", "交卡費"
+    "稅費", "捐款公益", "其他", "繳卡費", "繳貸款"
 ]
 CARD_CATEGORIES = EXPENSE_CATEGORIES.copy()
 INCOME_CATEGORIES = [
@@ -50,55 +62,149 @@ def now_tw():
     return datetime.datetime.now(TW)
 
 
-def get_sheet():
-    """連接試算表；將舊欄位轉成新欄位並保留既有記帳資料。"""
-    if not GOOGLE_CREDENTIALS_JSON:
-        raise RuntimeError("Render 尚未設定 GOOGLE_CREDENTIALS_JSON")
-    if not GOOGLE_SHEET_ID:
-        raise RuntimeError("Render 尚未設定 GOOGLE_SHEET_ID")
+def db_connect():
+    folder = os.path.dirname(DB_PATH)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=20)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+
+def init_db():
+    with db_connect() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS users (
+            line_user_id TEXT PRIMARY KEY,
+            credentials_json TEXT NOT NULL,
+            spreadsheet_id TEXT NOT NULL,
+            linked_at TEXT NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS oauth_sessions (
+            state TEXT PRIMARY KEY,
+            line_user_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS link_tokens (
+            token TEXT PRIMARY KEY,
+            line_user_id TEXT NOT NULL,
+            expires_at INTEGER NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS user_settings (
+            line_user_id TEXT PRIMARY KEY,
+            wallet_balance INTEGER NOT NULL DEFAULT 0,
+            account_balance INTEGER NOT NULL DEFAULT 0,
+            statement_day INTEGER NOT NULL DEFAULT 15
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS transaction_meta (
+            line_user_id TEXT NOT NULL,
+            sheet_row INTEGER NOT NULL,
+            payment_method TEXT NOT NULL DEFAULT 'bank',
+            PRIMARY KEY(line_user_id, sheet_row)
+        )""")
+
+
+def oauth_client_config():
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        raise RuntimeError("Render 尚未設定 GOOGLE_CLIENT_ID 或 GOOGLE_CLIENT_SECRET")
+    return {"web": {
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "redirect_uris": [OAUTH_REDIRECT_URI],
+    }}
+
+
+def get_user_row(line_user_id):
+    with db_connect() as conn:
+        return conn.execute("SELECT * FROM users WHERE line_user_id=?", (line_user_id,)).fetchone()
+
+
+def user_is_linked(line_user_id):
+    return get_user_row(line_user_id) is not None
+
+
+def credentials_for_user(line_user_id):
+    row = get_user_row(line_user_id)
+    if not row:
+        raise RuntimeError("你還沒連結 Google 帳號。請輸入「連結 Google 帳號」開始設定。")
+    info = json.loads(row["credentials_json"])
+    creds = UserCredentials.from_authorized_user_info(info, GOOGLE_SCOPES)
+    # google-auth 會在 access token 過期時用 refresh token 自動更新。
+    return creds, row["spreadsheet_id"]
+
+
+def get_sheet(line_user_id):
+    """開啟這位 LINE 使用者自己授權建立的試算表。"""
+    creds, spreadsheet_id = credentials_for_user(line_user_id)
     gc = gspread.authorize(creds)
-    sh = gc.open_by_key(GOOGLE_SHEET_ID)
-
+    sh = gc.open_by_key(spreadsheet_id)
     try:
         ws = sh.worksheet("記帳")
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title="記帳", rows="2000", cols="8")
         ws.update("A1", [HEADERS])
-        return ws
-
     values = ws.get_all_values()
     if not values:
         ws.update("A1", [HEADERS])
-        return ws
-
-    if values[0] != HEADERS:
-        old_headers = values[0]
-        old_rows = values[1:]
-        converted = [HEADERS]
-        if old_headers[:8] == ["日期", "時間", "傳送者", "大項目", "項目", "金額", "小項目", "原始訊息"]:
-            # 先前八欄版本：大項目→收支、小項目→項目、項目→內容；不保留原始訊息。
-            for row in old_rows:
-                row = row + [""] * max(0, 8 - len(row))
-                converted.append([row[0], row[1], row[2], row[3], row[6], row[4], row[5], ""])
-        elif old_headers[:7] == ["日期", "時間", "傳送者", "項目", "金額", "類別", "原始訊息"]:
-            # 更早的七欄版本。
-            for row in old_rows:
-                row = row + [""] * max(0, 7 - len(row))
-                converted.append([row[0], row[1], row[2], "支出", row[5], row[3], row[4], ""])
-        elif old_headers[:8] == HEADERS:
-            return ws
-        else:
-            # 不認得的表頭不自動清除，避免意外覆蓋使用者資料。
-            raise RuntimeError(
-                "「記帳」工作表的第一列欄位與程式不一致。請先備份試算表，再確認第一列欄名。"
-            )
-        ws.clear()
-        ws.update("A1", converted)
+    elif values[0] != HEADERS:
+        # 不自動清除使用者自己的資料，避免誤刪。
+        raise RuntimeError("「記帳」工作表欄位與程式不一致，請先備份後再處理。")
     return ws
+
+
+def create_link_token(line_user_id):
+    token = secrets.token_urlsafe(32)
+    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+    with db_connect() as conn:
+        conn.execute("INSERT INTO link_tokens(token,line_user_id,expires_at,used) VALUES(?,?,?,0)",
+                     (token, line_user_id, now + 600))
+    return token
+
+
+def consume_link_token(token):
+    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+    with db_connect() as conn:
+        row = conn.execute("SELECT line_user_id,expires_at,used FROM link_tokens WHERE token=?", (token,)).fetchone()
+        if not row or row["used"] or row["expires_at"] < now:
+            return None
+        conn.execute("UPDATE link_tokens SET used=1 WHERE token=?", (token,))
+        return row["line_user_id"]
+
+
+def save_oauth_session(state, line_user_id):
+    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+    with db_connect() as conn:
+        conn.execute("INSERT OR REPLACE INTO oauth_sessions(state,line_user_id,created_at) VALUES(?,?,?)",
+                     (state, line_user_id, now))
+
+
+def consume_oauth_session(state):
+    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+    with db_connect() as conn:
+        row = conn.execute("SELECT line_user_id,created_at FROM oauth_sessions WHERE state=?", (state,)).fetchone()
+        conn.execute("DELETE FROM oauth_sessions WHERE state=?", (state,))
+        if not row or now - int(row["created_at"]) > 600:
+            return None
+        return row["line_user_id"]
+
+
+def create_user_spreadsheet(creds, line_user_id):
+    gc = gspread.authorize(creds)
+    sh = gc.create("記帳小工具｜我的記帳")
+    ws = sh.sheet1
+    ws.update_title("記帳")
+    ws.update("A1", [HEADERS])
+    # 將 token 與這位 LINE 使用者的試算表 ID 存在 Render 資料庫。
+    with db_connect() as conn:
+        conn.execute("""INSERT INTO users(line_user_id,credentials_json,spreadsheet_id,linked_at)
+            VALUES(?,?,?,?) ON CONFLICT(line_user_id) DO UPDATE SET
+            credentials_json=excluded.credentials_json,
+            spreadsheet_id=excluded.spreadsheet_id,
+            linked_at=excluded.linked_at""",
+            (line_user_id, creds.to_json(), sh.id, now_tw().isoformat()))
+    return sh.url
 
 
 def parse_date_hint(text):
@@ -157,7 +263,7 @@ def infer_main_type(text):
     # 明確收入項目
     if re.search(r"(薪資|薪水|工資|獎金|利息收入|投資收入|兼職收入|收到紅包|收入|退款入帳)", s):
         return "收入"
-    # 「交卡費」是支出：代表實際把款項付出去。
+    # 「繳卡費」是支出：代表實際把款項付出去。
     if "交卡費" in s or "繳卡費" in s or "繳信用卡" in s:
         return "支出"
     # 未指定時，預設支出。
@@ -167,7 +273,7 @@ def infer_main_type(text):
 def clean_main_prefix(text, main_type):
     s = text.strip()
     prefixes = {
-        "刷卡": r"^(刷卡|信用卡|刷)\s*[:：,，|｜-]?\s*",
+        "刷卡": r"^(刷卡|信用卡|卡刷)\s*[:：,，|｜-]?\s*",
         "收入": r"^(收入|入帳|進帳)\s*[:：,，|｜-]?\s*",
         "支出": r"^(支出|花費|付款)\s*[:：,，|｜-]?\s*",
     }
@@ -192,8 +298,10 @@ def default_category(item, main_type):
             return "投資收入"
         return "其他"
 
-    if  "繳卡費" in s or "繳信用卡" in s:
+    if "交卡費" in s or "繳卡費" in s or "繳信用卡" in s:
         return "繳卡費"
+    if "繳貸款" in s or "貸款還款" in s:
+        return "繳貸款"
     if any(k in s for k in ["食材", "食物", "食品", "生鮮", "蔬菜", "水果", "肉類",
                              "海鮮", "零食", "點心", "飲料", "早餐", "午餐", "晚餐",
                              "宵夜", "飯", "麵", "鍋", "滷味", "咖啡", "便當", "餐"]):
@@ -295,29 +403,6 @@ def parse_record(text):
         return fallback_parse(text)
 
 
-def reply_message(reply_token, text):
-    if not reply_token or not LINE_CHANNEL_ACCESS_TOKEN:
-        sys.stdout.write("[LINE] 缺少 replyToken 或 LINE_CHANNEL_ACCESS_TOKEN，無法回覆\n")
-        return
-    url = "https://api.line.me/v2/bot/message/reply"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"
-    }
-    try:
-        response = req.post(
-            url,
-            headers=headers,
-            json={"replyToken": reply_token, "messages": [{"type": "text", "text": text}]},
-            timeout=15
-        )
-        if response.status_code >= 400:
-            sys.stdout.write(f"[LINE] 回覆失敗 {response.status_code}: {response.text}\n")
-    except Exception as e:
-        sys.stdout.write(f"[LINE] 回覆錯誤：{e}\n")
-
-
-
 # LINE 使用者名稱快取；試算表顯示 LINE 名稱，不顯示 U 開頭的 userId。
 _SENDER_NAME_CACHE = {}
 
@@ -355,11 +440,14 @@ def get_sender_name(user_id, source):
     return "未知使用者"
 
 
-def get_records():
-    ws = get_sheet()
+def get_records(line_user_id):
+    ws = get_sheet(line_user_id)
     rows = ws.get_all_records()
+    with db_connect() as conn:
+        meta_rows = conn.execute("SELECT sheet_row,payment_method FROM transaction_meta WHERE line_user_id=?", (line_user_id,)).fetchall()
+    methods = {int(x["sheet_row"]): x["payment_method"] for x in meta_rows}
     result = []
-    for row in rows:
+    for sheet_row, row in enumerate(rows, start=2):
         try:
             amount = int(str(row.get("金額", 0)).replace(",", ""))
             date_str = str(row.get("日期", "")).strip()
@@ -369,210 +457,464 @@ def get_records():
             result.append({
                 "日期": date_str,
                 "時間": str(row.get("時間", "")),
-                "傳送者": str(row.get("傳送者", "未知")),
+                "傳送者": str(row.get("傳送者", "未知使用者")),
                 "大項目": main_type,
                 "項目": str(row.get("內容", "")),
                 "金額": amount,
                 "小項目": str(row.get("項目", "其他")) or "其他",
                 "備註": str(row.get("備註", "")),
+                "_sheet_row": sheet_row,
+                "付款方式": methods.get(sheet_row, "bank"),
             })
         except (ValueError, TypeError):
             continue
     return result
 
 
-def monthly_total(main_type, today=None):
+def monthly_total(line_user_id, main_type, today=None):
     today = today or now_tw().date()
     ym = today.strftime("%Y-%m")
-    return sum(
-        r["金額"] for r in get_records()
-        if r["大項目"] == main_type and r["日期"].startswith(ym)
-    )
+    return sum(r["金額"] for r in get_records(line_user_id)
+               if r["大項目"] == main_type and r["日期"].startswith(ym))
 
 
 def cumulative_label(main_type):
-    labels = {"支出": "本月支出累積", "收入": "本月收入累積", "刷卡": "本月刷卡累積"}
-    return labels[main_type]
+    return {"支出": "本月支出累積", "收入": "本月收入累積", "刷卡": "本月刷卡累積"}[main_type]
 
 
-def save_record(sender, original_text, record):
-    ws = get_sheet()
-    current_time = now_tw().strftime("%H:%M")
+def save_record(line_user_id, sender, record, payment_method="bank"):
+    ws = get_sheet(line_user_id)
+    sheet_row = len(ws.get_all_values()) + 1
     ws.append_row([
-        record["date"], current_time, sender, record["main_type"],
+        record["date"], now_tw().strftime("%H:%M"), sender, record["main_type"],
         record["category"], record["item"], record["amount"], ""
     ], value_input_option="USER_ENTERED")
+    with db_connect() as conn:
+        conn.execute("INSERT OR REPLACE INTO transaction_meta(line_user_id,sheet_row,payment_method) VALUES(?,?,?)",
+                     (line_user_id, sheet_row, payment_method))
 
 
-def query_stats(period):
-    """今日／本月完整總覽：列出每筆明細、分類加總，以及三大項目各自的合計。"""
+def query_stats(line_user_id, period):
+    """今日／本月明細：列出每筆明細、分類加總，以及三大項目合計。"""
     try:
-        records = get_records()
+        records = get_records(line_user_id)
     except Exception as e:
-        return f"📭 無法連接試算表：{e}"
-
+        return f"📭 無法連接你的試算表：{str(e)[:180]}"
     today = now_tw().date()
     if period == "today":
         filtered = [r for r in records if r["日期"] == today.isoformat()]
-        title = f"📅 {today.strftime('%Y/%m/%d')} 今日記帳總覽"
-        empty_text = "今天還沒有記帳資料。"
+        title, empty_text = f"📅 {today.strftime('%Y/%m/%d')} 今日記帳總覽", "今天還沒有記帳資料。"
     else:
         ym = today.strftime("%Y-%m")
         filtered = [r for r in records if r["日期"].startswith(ym)]
-        title = f"📊 {today.strftime('%Y年%m月')} 本月記帳總覽"
-        empty_text = "本月還沒有記帳資料。"
-
+        title, empty_text = f"📊 {today.strftime('%Y年%m月')} 本月記帳總覽", "本月還沒有記帳資料。"
     if not filtered:
         return f"{title}\n\n{empty_text}\n\n💸 支出：$0\n💵 收入：$0\n💳 刷卡：$0"
-
-    # 固定依照支出、收入、刷卡順序顯示；各大項目獨立計算。
-    section_icons = {"支出": "💸", "收入": "💵", "刷卡": "💳"}
+    icons = {"支出": "💸", "收入": "💵", "刷卡": "💳"}
     lines = [title, ""]
-
     for main_type in MAIN_TYPES:
         type_rows = [r for r in filtered if r["大項目"] == main_type]
         total = sum(r["金額"] for r in type_rows)
-        lines.append(f"{section_icons[main_type]} {main_type}明細")
-
+        lines.append(f"{icons[main_type]} {main_type}明細")
         if not type_rows:
-            lines.append("  （沒有資料）")
-            lines.append(f"  合計：$0")
-            lines.append("")
+            lines.extend(["  （沒有資料）", "  合計：$0", ""])
             continue
-
-        # 每筆明細都列出日期（跨月回填或本月查詢時較清楚）、項目、金額與小項目。
         type_rows.sort(key=lambda r: (r["日期"], r["時間"], r["項目"]))
         for r in type_rows:
             date_label = r["日期"][5:] if len(r["日期"]) >= 10 else r["日期"]
-            category = r["小項目"] or "其他"
-            lines.append(f"  • {date_label} {r['項目']} ${r['金額']:,}（{category}）")
-
-        # 同時顯示小項目分類加總。
+            lines.append(f"  • {date_label} {r['項目']} ${r['金額']:,}（{r['小項目'] or '其他'}）")
         category_totals = {}
         for r in type_rows:
-            category = r["小項目"] or "其他"
-            category_totals[category] = category_totals.get(category, 0) + r["金額"]
-
+            cat = r["小項目"] or "其他"
+            category_totals[cat] = category_totals.get(cat, 0) + r["金額"]
         lines.append("  分類小計：")
-        for category, amount in sorted(category_totals.items(), key=lambda x: (-x[1], x[0])):
-            lines.append(f"    └ {category}：${amount:,}")
-        lines.append(f"  **{main_type}合計：${total:,}**")
-        lines.append("")
-
+        for cat, amount in sorted(category_totals.items(), key=lambda x: (-x[1], x[0])):
+            lines.append(f"    └ {cat}：${amount:,}")
+        lines.extend([f"  **{main_type}合計：${total:,}**", ""])
     return "\n".join(lines)
 
 
-
-def delete_latest_record(sender):
-    """刪除這位使用者最近新增的一筆記帳；每輸入一次「刪除」就往前刪一筆。"""
-    ws = get_sheet()
+def delete_latest_record(line_user_id):
+    """每個使用者只有自己的試算表，因此只會刪除自己的最後一筆。"""
+    ws = get_sheet(line_user_id)
     rows = ws.get_all_records()
-    sender_col = "傳送者"
-    for index in range(len(rows) - 1, -1, -1):
-        row = rows[index]
-        if str(row.get(sender_col, "")) == str(sender):
-            sheet_row_number = index + 2  # 第 1 列是欄名，資料從第 2 列開始
-            item = str(row.get("內容", "未命名項目"))
-            amount = str(row.get("金額", "0"))
-            main_type = str(row.get("收支", "支出"))
-            ws.delete_rows(sheet_row_number)
-            return f"🗑️ 已刪除上一筆：{main_type}｜{item} ${amount}"
-    return "目前找不到你新增的記帳資料。"
+    if not rows:
+        return "目前找不到你新增的記帳資料。"
+    row = rows[-1]
+    sheet_row_number = len(rows) + 1
+    item = str(row.get("內容", "未命名項目"))
+    amount = str(row.get("金額", "0"))
+    main_type = str(row.get("收支", "支出"))
+    ws.delete_rows(sheet_row_number)
+    with db_connect() as conn:
+        conn.execute("DELETE FROM transaction_meta WHERE line_user_id=? AND sheet_row=?", (line_user_id, sheet_row_number))
+    return f"🗑️ 已刪除上一筆：{main_type}｜{item} ${amount}"
 
-def query_people_stats():
+
+def get_settings(line_user_id):
+    with db_connect() as conn:
+        conn.execute("INSERT OR IGNORE INTO user_settings(line_user_id) VALUES(?)", (line_user_id,))
+        row = conn.execute("SELECT * FROM user_settings WHERE line_user_id=?", (line_user_id,)).fetchone()
+        return dict(row)
+
+
+def set_setting(line_user_id, field, value):
+    allowed = {"wallet_balance", "account_balance", "statement_day"}
+    if field not in allowed:
+        raise ValueError("不支援的設定")
+    with db_connect() as conn:
+        conn.execute("INSERT OR IGNORE INTO user_settings(line_user_id) VALUES(?)", (line_user_id,))
+        conn.execute(f"UPDATE user_settings SET {field}=? WHERE line_user_id=?", (value, line_user_id))
+
+
+def cycle_start(today, statement_day):
+    import calendar
+    this_month_last = calendar.monthrange(today.year, today.month)[1]
+    statement_day = min(max(1, statement_day), this_month_last)
+    if today.day > statement_day:
+        start_day = min(statement_day + 1, this_month_last)
+        return datetime.date(today.year, today.month, start_day)
+    # 上個月結算日隔天為本期起日
+    if today.month == 1:
+        year, month = today.year - 1, 12
+    else:
+        year, month = today.year, today.month - 1
+    last = calendar.monthrange(year, month)[1]
+    prev_statement = min(statement_day, last)
+    if prev_statement >= last:
+        # 上個月的結算日已是該月最後一天，本期從本月 1 日開始。
+        return datetime.date(today.year, today.month, 1)
+    return datetime.date(year, month, prev_statement + 1)
+
+
+def query_people_stats(line_user_id):
+    """顯示個人累積收支、現金／帳戶估算餘額與本期刷卡金額。"""
     try:
-        records = get_records()
+        records = get_records(line_user_id)
+        settings = get_settings(line_user_id)
     except Exception as e:
-        return f"📭 無法連接試算表：{e}"
-    ym = now_tw().date().strftime("%Y-%m")
-    filtered = [r for r in records if r["日期"].startswith(ym)]
-    if not filtered:
-        return "📊 本月各人統計\n\n目前沒有資料。"
+        return f"📭 無法連接你的試算表：{str(e)[:180]}"
+    total_income = sum(r["金額"] for r in records if r["大項目"] == "收入")
+    total_expense = sum(r["金額"] for r in records if r["大項目"] == "支出")
+    wallet = int(settings["wallet_balance"])
+    account = int(settings["account_balance"])
+    for r in records:
+        if r["大項目"] == "收入":
+            # 收入預設入帳戶；如要記現金收入，使用者仍可手動調整錢包初始餘額。
+            account += r["金額"]
+        elif r["大項目"] == "支出":
+            if r.get("付款方式") == "cash":
+                wallet -= r["金額"]
+            else:
+                account -= r["金額"]
+    today = now_tw().date()
+    start = cycle_start(today, int(settings["statement_day"]))
+    card_total = sum(r["金額"] for r in records if r["大項目"] == "刷卡"
+                     and start.isoformat() <= r["日期"] <= today.isoformat())
+    return (f"📊 個人財務統計\n\n"
+            f"💵 累積收入：${total_income:,}\n"
+            f"💸 累積支出：${total_expense:,}\n"
+            f"👛 目前錢包現金：${wallet:,}\n"
+            f"🏦 目前銀行帳戶：${account:,}\n"
+            f"💳 本期已刷（{start.strftime('%m/%d')}～{today.strftime('%m/%d')}）：${card_total:,}\n\n"
+            "📌 一般支出預設從銀行帳戶扣除；輸入「現金 午餐 100」可從錢包現金扣除。")
 
-    totals = {}
-    for r in filtered:
-        key = (r["傳送者"], r["大項目"])
-        totals[key] = totals.get(key, 0) + r["金額"]
 
-    lines = [f"👥 {now_tw().strftime('%Y年%m月')} 各人統計", ""]
-    for (person, main_type), amount in sorted(totals.items(), key=lambda x: (x[0][0], x[0][1])):
-        lines.append(f"{person}｜{main_type}：${amount:,}")
-    return "\n".join(lines)
+def flex_button(label, action):
+    return {"type": "button", "style": "primary", "color": "#2E8B78", "action": action, "height": "sm"}
+
+
+def reply_messages(reply_token, messages):
+    if not reply_token or not LINE_CHANNEL_ACCESS_TOKEN:
+        sys.stdout.write("[LINE] 缺少 replyToken 或 LINE_CHANNEL_ACCESS_TOKEN，無法回覆\n")
+        return
+    try:
+        response = req.post(
+            "https://api.line.me/v2/bot/message/reply",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+            json={"replyToken": reply_token, "messages": messages}, timeout=15
+        )
+        if response.status_code >= 400:
+            sys.stdout.write(f"[LINE] 回覆失敗 {response.status_code}: {response.text}\n")
+    except Exception as e:
+        sys.stdout.write(f"[LINE] 回覆錯誤：{e}\n")
+
+
+def reply_message(reply_token, text):
+    reply_messages(reply_token, [{"type": "text", "text": str(text)[:4900]}])
+
+
+def link_google_flex_message(link_url):
+    return {"type": "flex", "altText": "連結你的 Google 帳號", "contents": {
+        "type": "bubble", "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
+            {"type": "text", "text": "連結 Google 帳號", "weight": "bold", "size": "lg"},
+            {"type": "text", "text": "點擊下方按鈕，授權自己的 Google 帳號，建立只屬於你的記帳試算表。", "wrap": True, "size": "sm"}
+        ]},
+        "footer": {"type": "box", "layout": "vertical", "contents": [
+            flex_button("連結 Google 帳號", {"type": "uri", "label": "連結 Google 帳號", "uri": link_url})
+        ]}
+    }}
+
+
+WELCOME_MESSAGE = """🎉 歡迎使用「記帳小工具」！💚
+
+讓記帳變簡單，輕鬆掌握自己的每一筆錢！
+
+✨ 第一次使用，請先完成初始設定
+
+👛 錢包餘額：目前身上有多少現金
+例如：錢包餘額 1500
+
+🏦 帳戶餘額：目前銀行帳戶裡有多少錢
+例如：帳戶餘額 25000
+
+💳 信用卡結算日：信用卡的結算日期
+例如：信用卡結算日 15
+
+📝 記帳超簡單
+
+• 午餐 100：記錄一般支出（預設從銀行帳戶扣除）
+• 現金 午餐 100：從錢包現金扣除
+• 金融卡 午餐 100：從銀行帳戶扣除
+• 刷卡 買衣服 890：記錄信用卡消費
+• 收入 薪水 28000：記錄收入
+• 繳貸款 5704：記錄貸款繳費
+• 繳卡費 5000：記錄信用卡繳費
+
+📅 忘記當天記帳也沒關係！支援昨天、前天及指定日期，輕鬆補記帳目。
+
+📊 小工具指令說明
+
+• 今日：查看今天的收支與刷卡明細
+• 本月：查看本月的收支與刷卡明細
+• 統計：查看累積收入、累積支出、目前餘額及本期已刷金額
+• 說明：查看完整使用方式
+• 刪除：刪除自己最近一筆記帳
+
+💚 先連結 Google 帳號，再開始你的記帳生活吧！✨"""
+
+HELP_MESSAGE = """📖 記帳小工具｜使用說明 💚
+
+📝 一、如何記帳
+
+直接輸入項目和金額即可：
+
+• 午餐 100：記錄一般支出（預設從銀行帳戶扣除）
+• 現金 午餐 100：從錢包現金扣除
+• 金融卡 午餐 100：從銀行帳戶扣除
+• 刷卡 買衣服 890：記錄信用卡消費
+• 收入 薪水 28000：記錄收入
+• 繳貸款 5704：記錄貸款繳費
+• 繳卡費 5000：記錄信用卡繳費
+
+📅 二、日期設定與補記
+
+忘記當天記帳也沒關係，可以指定日期：
+
+• 午餐 100：記錄今天的午餐
+• 昨天 午餐 100：記錄昨天的午餐
+• 前天 買衣服 890：記錄前天的消費
+• 2026/10/15 晚餐 150：記錄指定日期的晚餐
+
+📊 三、小工具指令
+
+• 今日：查看今天的收支與刷卡明細
+• 本月：查看本月的收支與刷卡明細
+• 統計：查看累積收入、累積支出、目前餘額及本期已刷金額
+• 說明：查看完整使用方式
+• 刪除：刪除自己最近一筆記帳
+• 連結 Google 帳號：連結或重新連結自己的 Google 帳號
+
+💚 記帳就是這麼簡單！祝你每天都能輕鬆掌握自己的財務狀況！✨"""
+
+
+def welcome_flex():
+    return {"type": "flex", "altText": "歡迎使用記帳小工具", "contents": {
+        "type": "bubble", "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
+            {"type": "text", "text": WELCOME_MESSAGE, "wrap": True, "size": "sm"}
+        ]},
+        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
+            flex_button("連結 Google 帳號", {"type": "postback", "label": "連結 Google 帳號", "data": "action=google_link"}),
+            {"type": "text", "text": "每位使用者請自行連結自己的 Google 帳號。", "size": "xs", "color": "#666666", "wrap": True}
+        ]}
+    }}
 
 
 def handle_event(event):
-    if event.get("type") != "message":
+    event_type = event.get("type")
+    reply_token = event.get("replyToken", "")
+    source = event.get("source", {})
+    line_user_id = source.get("userId", "")
+
+    if event_type == "join":
+        reply_messages(reply_token, [welcome_flex()])
+        sys.stdout.write("[WELCOME] 已送出加入聊天室歡迎詞\n")
+        return
+
+    if event_type == "postback":
+        data = (event.get("postback") or {}).get("data", "")
+        if data == "action=google_link":
+            if not line_user_id:
+                reply_message(reply_token, "⚠️ 無法辨識你的 LINE 帳號，請在群組內重新點選。")
+                return
+            token = create_link_token(line_user_id)
+            link_url = f"{BASE_URL}/auth/start?link_token={quote(token)}"
+            reply_messages(reply_token, [link_google_flex_message(link_url)])
+        return
+
+    if event_type != "message":
         return
     msg = event.get("message", {})
     if msg.get("type") != "text":
         return
-
     text = msg.get("text", "").strip()
-    reply_token = event.get("replyToken", "")
-    source = event.get("source", {})
-    sender_id = source.get("userId", "")
-    sender = get_sender_name(sender_id, source)
+    if not line_user_id:
+        reply_message(reply_token, "⚠️ 無法辨識你的 LINE 帳號，請重新傳送訊息。")
+        return
+    sender = get_sender_name(line_user_id, source)
     sys.stdout.write(f"[MSG] {text!r} from {sender}\n")
 
+    if text in ["連結 Google 帳號", "連結Google", "Google連結", "重新連結 Google 帳號"]:
+        token = create_link_token(line_user_id)
+        link_url = f"{BASE_URL}/auth/start?link_token={quote(token)}"
+        reply_messages(reply_token, [link_google_flex_message(link_url)])
+        return
+
+    if text in ["說明", "/說明", "help", "/help"]:
+        reply_message(reply_token, HELP_MESSAGE)
+        return
+
+    # 查詢、刪除與記帳都限定在目前 LINE 使用者自己的試算表。
+    if not user_is_linked(line_user_id):
+        reply_message(reply_token, "💚 你還沒連結自己的 Google 帳號喔！\n請輸入「連結 Google 帳號」，再點選按鈕完成授權。")
+        return
+
+    setting_match = re.fullmatch(r"(錢包餘額|帳戶餘額|信用卡結算日)\s*[:：]?\s*(\d+)", text)
+    if setting_match:
+        setting_name, value_text = setting_match.groups()
+        value = int(value_text)
+        if setting_name == "信用卡結算日":
+            if not 1 <= value <= 31:
+                reply_message(reply_token, "信用卡結算日請輸入 1～31 的數字。")
+                return
+            set_setting(line_user_id, "statement_day", value)
+            reply_message(reply_token, f"✅ 信用卡結算日已設定為每月 {value} 日。")
+        elif setting_name == "錢包餘額":
+            set_setting(line_user_id, "wallet_balance", value)
+            reply_message(reply_token, f"✅ 初始錢包餘額已設定為 ${value:,}。這筆不會算成收入。")
+        else:
+            set_setting(line_user_id, "account_balance", value)
+            reply_message(reply_token, f"✅ 初始帳戶餘額已設定為 ${value:,}。這筆不會算成收入。")
+        return
+
     commands = {
-        "今日": lambda: query_stats("today"),
-        "今天": lambda: query_stats("today"),
-        "/今日": lambda: query_stats("today"),
-        "/today": lambda: query_stats("today"),
-        "本月": lambda: query_stats("month"),
-        "/本月": lambda: query_stats("month"),
-        "/month": lambda: query_stats("month"),
-        "統計": query_people_stats,
-        "/統計": query_people_stats,
-        "/stats": query_people_stats,
+        "今日": lambda: query_stats(line_user_id, "today"),
+        "今天": lambda: query_stats(line_user_id, "today"),
+        "/今日": lambda: query_stats(line_user_id, "today"),
+        "/today": lambda: query_stats(line_user_id, "today"),
+        "本月": lambda: query_stats(line_user_id, "month"),
+        "/本月": lambda: query_stats(line_user_id, "month"),
+        "/month": lambda: query_stats(line_user_id, "month"),
+        "統計": lambda: query_people_stats(line_user_id),
+        "/統計": lambda: query_people_stats(line_user_id),
+        "/stats": lambda: query_people_stats(line_user_id),
     }
     if text in commands:
         reply_message(reply_token, commands[text]())
         return
 
-    if text in ["說明", "/說明", "help", "/help"]:
-        reply_message(
-            reply_token,
-            "📒 記帳小工具\n\n"
-            "支出：早餐 100\n"
-            "收入：收入 薪資 30000\n"
-            "刷卡：刷卡 午餐 150\n"
-            "補記日期：昨天早餐 100、2026/10/15 午餐 120\n\n"
-            "查詢：今日、本月、統計、說明\n"
-            "刪除：輸入「刪除」會刪除你最近新增的一筆；再輸入一次就再刪上一筆。"
-        )
-        return
-
     if text in ["刪除", "刪除上一筆", "刪除上一筆記帳"]:
         try:
-            reply_message(reply_token, delete_latest_record(sender))
+            reply_message(reply_token, delete_latest_record(line_user_id))
         except Exception as e:
             sys.stdout.write(f"[SHEETS] 刪除失敗：{e}\n")
-            reply_message(reply_token, f"⚠️ 刪除失敗，請稍後再試。原因：{str(e)[:200]}")
+            reply_message(reply_token, f"⚠️ 刪除失敗，請稍後再試。原因：{str(e)[:180]}")
         return
 
-    record = parse_record(text)
+    payment_method = "bank"
+    parse_text = text
+    if re.match(r"^現金(?:\s|[:：])", parse_text):
+        payment_method = "cash"
+        parse_text = re.sub(r"^現金\s*[:：]?\s*", "", parse_text)
+    elif re.match(r"^(金融卡|帳戶|銀行帳戶)(?:\s|[:：])", parse_text):
+        payment_method = "bank"
+        parse_text = re.sub(r"^(金融卡|帳戶|銀行帳戶)\s*[:：]?\s*", "", parse_text)
+    record = parse_record(parse_text)
     if not record:
         return
-
     try:
-        save_record(sender, text, record)
-        total = monthly_total(record["main_type"])
+        save_record(line_user_id, sender, record, payment_method)
+        total = monthly_total(line_user_id, record["main_type"])
         label = cumulative_label(record["main_type"])
         saved_date = datetime.date.fromisoformat(record["date"])
-        date_note = ""
-        if saved_date != now_tw().date():
-            date_note = f"\n📅 記錄日期：{saved_date.strftime('%Y/%m/%d')}"
-        response_text = (
-            f"✅ {record['main_type']}｜{record['item']} ${record['amount']:,}"
-            f"（{record['category']}）{date_note}\n"
-            f"📊 {label}：${total:,}"
-        )
+        date_note = f"\n📅 記錄日期：{saved_date.strftime('%Y/%m/%d')}" if saved_date != now_tw().date() else ""
+        response_text = (f"✅ {record['main_type']}｜{record['item']} ${record['amount']:,}"
+                         f"（{record['category']}）{date_note}\n📊 {label}：${total:,}")
         reply_message(reply_token, response_text)
         sys.stdout.write(f"[SHEETS] 寫入成功：{record}\n")
     except Exception as e:
         sys.stdout.write(f"[SHEETS] 寫入失敗：{e}\n")
-        reply_message(reply_token, f"⚠️ 這筆記帳沒有成功寫入，請稍後再試。\n原因：{str(e)[:250]}")
+        reply_message(reply_token, f"⚠️ 這筆記帳沒有成功寫入，請稍後再試。\n原因：{str(e)[:200]}")
+
+
+init_db()
+
+@app.route("/auth/start", methods=["GET"])
+def auth_start():
+    link_token = request.args.get("link_token", "")
+    line_user_id = consume_link_token(link_token)
+    if not line_user_id:
+        return "連結已過期或已使用。請回到 LINE 群組，重新點選「連結 Google 帳號」。", 400
+    try:
+        flow = Flow.from_client_config(oauth_client_config(), scopes=GOOGLE_SCOPES, redirect_uri=OAUTH_REDIRECT_URI)
+        auth_url, state = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent")
+        save_oauth_session(state, line_user_id)
+        return __import__("flask").redirect(auth_url)
+    except Exception as e:
+        sys.stdout.write(f"[OAUTH] 建立授權網址失敗：{e}\n")
+        return "Google 授權設定尚未完成，請確認 Render 環境變數及 Google Cloud 設定。", 500
+
+
+@app.route("/auth/callback", methods=["GET"])
+def auth_callback():
+    error = request.args.get("error")
+    state = request.args.get("state", "")
+    line_user_id = consume_oauth_session(state)
+    if error:
+        return "你取消了 Google 授權。請回到 LINE 重新點選「連結 Google 帳號」。", 400
+    if not line_user_id:
+        return "授權連結已過期，請回到 LINE 重新點選「連結 Google 帳號」。", 400
+    code = request.args.get("code", "")
+    if not code:
+        return "Google 沒有回傳授權碼，請重新操作。", 400
+    try:
+        flow = Flow.from_client_config(oauth_client_config(), scopes=GOOGLE_SCOPES, state=state, redirect_uri=OAUTH_REDIRECT_URI)
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+        spreadsheet_url = create_user_spreadsheet(creds, line_user_id)
+        # 通知使用者授權成功；不把試算表連結貼到群組。
+        push_message(line_user_id, "✅ Google 帳號連結成功！\n已在你的 Google Drive 建立專屬「記帳小工具｜我的記帳」試算表。\n現在可以回到 LINE 群組開始記帳了。")
+        return ("<html><meta charset='utf-8'><body style='font-family:sans-serif;padding:24px'>"
+                "<h2>✅ Google 帳號連結成功！</h2>"
+                "<p>已建立你的專屬記帳試算表。你可以關閉此頁，回到 LINE 開始記帳。</p>"
+                f"<p><a href='{spreadsheet_url}' target='_blank' rel='noopener'>開啟我的 Google 試算表</a></p>"
+                "</body></html>")
+    except Exception as e:
+        sys.stdout.write(f"[OAUTH] 授權完成但建立試算表失敗：{e}\n")
+        return "Google 授權完成，但建立試算表失敗。請稍後回到 LINE 重新連結，並確認已啟用 Google Drive API 與 Google Sheets API。", 500
+
+
+def push_message(line_user_id, text):
+    if not LINE_CHANNEL_ACCESS_TOKEN or not line_user_id:
+        return
+    try:
+        response = req.post("https://api.line.me/v2/bot/message/push",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+            json={"to": line_user_id, "messages": [{"type": "text", "text": text[:4900]}]}, timeout=15)
+        if response.status_code >= 400:
+            sys.stdout.write(f"[LINE PUSH] 失敗 {response.status_code}: {response.text}\n")
+    except Exception as e:
+        sys.stdout.write(f"[LINE PUSH] 錯誤：{e}\n")
 
 
 @app.route("/callback", methods=["POST"])
@@ -607,5 +949,6 @@ def health():
 
 
 if __name__ == "__main__":
+    init_db()
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
