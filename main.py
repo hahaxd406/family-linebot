@@ -416,8 +416,25 @@ def query_stats(period):
         lines.append(f"  **{main_type}合計：${total:,}**")
         lines.append("")
 
+    return "\n".join(lines)
 
 
+
+def delete_latest_record(sender):
+    """刪除這位使用者最近新增的一筆記帳；每輸入一次「刪除」就往前刪一筆。"""
+    ws = get_sheet()
+    rows = ws.get_all_records()
+    sender_col = "傳送者"
+    for index in range(len(rows) - 1, -1, -1):
+        row = rows[index]
+        if str(row.get(sender_col, "")) == str(sender):
+            sheet_row_number = index + 2  # 第 1 列是欄名，資料從第 2 列開始
+            item = str(row.get("項目", "未命名項目"))
+            amount = str(row.get("金額", "0"))
+            main_type = str(row.get("大項目", "支出"))
+            ws.delete_rows(sheet_row_number)
+            return f"🗑️ 已刪除上一筆：{main_type}｜{item} ${amount}"
+    return "目前找不到你新增的記帳資料。"
 
 def query_people_stats():
     try:
@@ -453,10 +470,14 @@ def handle_event(event):
     sys.stdout.write(f"[MSG] {text!r} from {sender}\n")
 
     commands = {
+        "今日": lambda: query_stats("today"),
+        "今天": lambda: query_stats("today"),
         "/今日": lambda: query_stats("today"),
         "/today": lambda: query_stats("today"),
+        "本月": lambda: query_stats("month"),
         "/本月": lambda: query_stats("month"),
         "/month": lambda: query_stats("month"),
+        "統計": query_people_stats,
         "/統計": query_people_stats,
         "/stats": query_people_stats,
     }
@@ -464,17 +485,26 @@ def handle_event(event):
         reply_message(reply_token, commands[text]())
         return
 
-    if text in ["/說明", "/help"]:
+    if text in ["說明", "/說明", "help", "/help"]:
         reply_message(
             reply_token,
-            "📒 記帳小工具｜使用說明\n\n"
-            "直接記帳（預設支出）：\n早餐 100\n昨天的早餐 100\n前天停車費 80\n\n"
-            "收入：\n收入 薪資 30000\n\n"
-            "刷卡：\n刷卡 午餐 150\n昨天刷卡 交通 120\n\n"
-            "繳信用卡費（實際付款，記為支出）：\n交卡費 5000\n\n"
-            "日期也可寫：2026/10/15 早餐 100\n\n"
-            "查詢：/今日、/本月、/統計、/說明"
+            "📒 記帳小工具\n\n"
+            "直接記帳：早餐 100\n"
+            "收入：收入 薪資 30000\n"
+            "刷卡：刷卡 午餐 150\n"
+            "繳卡費：交卡費 5000\n"
+            "補記日期：昨天早餐 100、2026/10/15 午餐 120\n\n"
+            "查詢：今日、本月、統計、說明\n"
+            "刪除：輸入「刪除」會刪除你最近新增的一筆；再輸入一次就再刪上一筆。"
         )
+        return
+
+    if text in ["刪除", "刪除上一筆", "刪除上一筆記帳"]:
+        try:
+            reply_message(reply_token, delete_latest_record(sender))
+        except Exception as e:
+            sys.stdout.write(f"[SHEETS] 刪除失敗：{e}\n")
+            reply_message(reply_token, f"⚠️ 刪除失敗，請稍後再試。原因：{str(e)[:200]}")
         return
 
     record = parse_record(text)
