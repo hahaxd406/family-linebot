@@ -1113,7 +1113,7 @@ def health():
 <style>body{font-family:-apple-system,BlinkMacSystemFont,'Noto Sans TC',sans-serif;max-width:760px;margin:48px auto;padding:0 20px;line-height:1.8;color:#263238}h1{color:#087f75}a{color:#087f75}main{background:#f5fbfa;padding:24px;border-radius:16px}</style></head>
 <body><main><h1>💚 記帳小工具</h1><p>記帳小工具協助使用者記錄日常收入、支出、信用卡消費及貸款繳費，並查看不同期間的收支統計。</p>
 <p>使用者可透過 Google 帳號授權，讓服務建立及操作個人 Google 試算表，以保存記帳資料。</p>
-<p><a href="/privacy">查看隱私權政策</a></p></main></body></html>""", 200, {"Content-Type": "text/html; charset=utf-8"}
+<p><a href="/privacy">查看隱私權政策</a> ｜ <a href="/terms">查看服務條款</a></p></main></body></html>""", 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
 @app.route("/privacy", methods=["GET"])
@@ -1133,7 +1133,28 @@ def privacy_policy():
 <h2>六、兒童隱私</h2><p>本服務並非專為兒童設計。如監護人認為兒童提供了不適當的個人資料，請透過提供本服務的 LINE 官方帳號聯絡管理者。</p>
 <h2>七、政策更新</h2><p>本政策可能因服務功能或法律要求調整；更新版本會發布於本頁。</p>
 <h2>八、聯絡方式</h2><p>如對本政策或個人資料處理有疑問，請透過提供記帳小工具的 LINE 官方帳號聯絡服務管理者。</p>
-<p><a href="/">返回記帳小工具首頁</a></p></body></html>""", 200, {"Content-Type": "text/html; charset=utf-8"}
+<p><a href="/terms">查看服務條款</a> ｜ <a href="/">返回記帳小工具首頁</a></p></body></html>""", 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@app.route("/terms", methods=["GET"])
+def terms_of_service():
+    # 公開服務條款頁面，供使用者與 Google OAuth 品牌設定查看。
+    return """<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>服務條款｜記帳小工具</title>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,'Noto Sans TC',sans-serif;max-width:820px;margin:40px auto;padding:0 20px;line-height:1.85;color:#263238}h1,h2{color:#087f75}a{color:#087f75}</style></head>
+<body><h1>服務條款｜記帳小工具</h1><p>最後更新日期：2026 年 10 月 19 日</p>
+<p>歡迎使用「記帳小工具」。使用本服務即表示你已閱讀並理解本條款；若你不同意本條款，請停止使用本服務。</p>
+<h2>一、服務內容</h2><p>本服務協助使用者透過 LINE 記錄日常收入、支出、信用卡消費及貸款繳費，並提供記帳資料查詢與統計。服務功能可能因維護、更新或技術限制而調整。</p>
+<h2>二、帳號與授權</h2><p>部分功能需要使用者自行連結 LINE 帳號及授權 Google 帳號。使用者應確認授權畫面所列權限，並自行保管帳號安全。若撤銷 Google 授權，依賴該授權的功能可能無法繼續使用。</p>
+<h2>三、使用者責任</h2><p>使用者應確保輸入資料的正確性，並僅以合法方式使用本服務。請勿利用本服務侵害他人權益、干擾系統運作或從事違法活動。</p>
+<h2>四、記帳資料與備份</h2><p>記帳資料可能儲存在使用者授權的 Google 試算表及服務運作所需的資料庫。使用者應自行確認記帳內容並適時備份重要資料。本服務不保證任何資料在所有情況下都不會發生遺失、延遲或錯誤。</p>
+<h2>五、非財務或稅務建議</h2><p>本服務提供的是記錄與整理工具，不構成投資、財務、法律或稅務建議。使用者應自行判斷資料用途，並為個人財務決策負責。</p>
+<h2>六、服務變更與可用性</h2><p>本服務可能因維護、系統故障、第三方平台政策或其他因素暫時中斷或變更功能。我們會在合理範圍內維護服務，但不保證服務永不中斷或完全沒有錯誤。</p>
+<h2>七、責任限制</h2><p>在法律允許的範圍內，本服務不對因使用或無法使用本服務、輸入資料錯誤、第三方平台中斷或資料未能成功同步所造成的間接損失負責。任何依法不得排除或限制的責任，仍依適用法律處理。</p>
+<h2>八、條款更新</h2><p>本條款可能因服務功能或適用規範調整；更新版本會發布於本頁。更新後繼續使用本服務，即表示你接受更新後的條款。</p>
+<h2>九、聯絡方式</h2><p>如對本條款有疑問，請透過提供記帳小工具的 LINE 官方帳號聯絡服務管理者。</p>
+<p><a href="/privacy">查看隱私權政策</a> ｜ <a href="/">返回記帳小工具首頁</a></p></body></html>""", 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
 if __name__ == "__main__":
