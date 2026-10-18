@@ -122,11 +122,19 @@ def init_db():
             spreadsheet_id TEXT NOT NULL,
             linked_at TEXT NOT NULL
         )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS oauth_sessions (
-            state TEXT PRIMARY KEY,
-            line_user_id TEXT NOT NULL,
-            created_at INTEGER NOT NULL
-        )""")
+        
+conn.execute("""CREATE TABLE IF NOT EXISTS oauth_sessions (
+    state TEXT PRIMARY KEY,
+    line_user_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    code_verifier TEXT
+)""")
+
+conn.execute("""
+    ALTER TABLE oauth_sessions
+    ADD COLUMN IF NOT EXISTS code_verifier TEXT
+""")
+
         conn.execute("""CREATE TABLE IF NOT EXISTS link_tokens (
             token TEXT PRIMARY KEY,
             line_user_id TEXT NOT NULL,
