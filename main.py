@@ -9,7 +9,8 @@ import base64
 import hashlib
 import datetime
 import threading
-import sqlite3
+import psycopg
+from psycopg.rows import dict_row
 import secrets
 from urllib.parse import quote
 
@@ -32,7 +33,7 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 BASE_URL = os.environ.get("BASE_URL", "https://family-linebot-mv4v.onrender.com").rstrip("/")
 OAUTH_REDIRECT_URI = os.environ.get("OAUTH_REDIRECT_URI", f"{BASE_URL}/auth/callback")
-DB_PATH = os.environ.get("DB_PATH", "/var/data/record_bot.sqlite3")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/spreadsheets",
@@ -62,13 +63,33 @@ def now_tw():
     return datetime.datetime.now(TW)
 
 
+class DBConnection:
+    """Small compatibility wrapper so the existing app can use PostgreSQL."""
+    def __init__(self):
+        if not DATABASE_URL:
+            raise RuntimeError("Render 尚未設定 DATABASE_URL（PostgreSQL 連線網址）")
+        self.conn = psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=15)
+
+    def execute(self, sql, params=()):
+        # Existing app uses SQLite-style ? placeholders; convert them for psycopg.
+        return self.conn.execute(sql.replace("?", "%s"), params)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                self.conn.commit()
+            else:
+                self.conn.rollback()
+        finally:
+            self.conn.close()
+        return False
+
+
 def db_connect():
-    folder = os.path.dirname(DB_PATH)
-    if folder:
-        os.makedirs(folder, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=20)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return DBConnection()
 
 
 def init_db():
@@ -176,8 +197,9 @@ def consume_link_token(token):
 def save_oauth_session(state, line_user_id):
     now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
     with db_connect() as conn:
-        conn.execute("INSERT OR REPLACE INTO oauth_sessions(state,line_user_id,created_at) VALUES(?,?,?)",
-                     (state, line_user_id, now))
+        conn.execute("""INSERT INTO oauth_sessions(state,line_user_id,created_at) VALUES(?,?,?)
+                     ON CONFLICT(state) DO UPDATE SET line_user_id=EXCLUDED.line_user_id,
+                     created_at=EXCLUDED.created_at""", (state, line_user_id, now))
 
 
 def consume_oauth_session(state):
@@ -200,9 +222,9 @@ def create_user_spreadsheet(creds, line_user_id):
     with db_connect() as conn:
         conn.execute("""INSERT INTO users(line_user_id,credentials_json,spreadsheet_id,linked_at)
             VALUES(?,?,?,?) ON CONFLICT(line_user_id) DO UPDATE SET
-            credentials_json=excluded.credentials_json,
-            spreadsheet_id=excluded.spreadsheet_id,
-            linked_at=excluded.linked_at""",
+            credentials_json=EXCLUDED.credentials_json,
+            spreadsheet_id=EXCLUDED.spreadsheet_id,
+            linked_at=EXCLUDED.linked_at""",
             (line_user_id, creds.to_json(), sh.id, now_tw().isoformat()))
     return sh.url
 
@@ -490,7 +512,8 @@ def save_record(line_user_id, sender, record, payment_method="bank"):
         record["category"], record["item"], record["amount"], ""
     ], value_input_option="USER_ENTERED")
     with db_connect() as conn:
-        conn.execute("INSERT OR REPLACE INTO transaction_meta(line_user_id,sheet_row,payment_method) VALUES(?,?,?)",
+        conn.execute("""INSERT INTO transaction_meta(line_user_id,sheet_row,payment_method) VALUES(?,?,?)
+                     ON CONFLICT(line_user_id,sheet_row) DO UPDATE SET payment_method=EXCLUDED.payment_method""",
                      (line_user_id, sheet_row, payment_method))
 
 
@@ -553,7 +576,7 @@ def delete_latest_record(line_user_id):
 
 def get_settings(line_user_id):
     with db_connect() as conn:
-        conn.execute("INSERT OR IGNORE INTO user_settings(line_user_id) VALUES(?)", (line_user_id,))
+        conn.execute("INSERT INTO user_settings(line_user_id) VALUES(?) ON CONFLICT(line_user_id) DO NOTHING", (line_user_id,))
         row = conn.execute("SELECT * FROM user_settings WHERE line_user_id=?", (line_user_id,)).fetchone()
         return dict(row)
 
@@ -563,7 +586,7 @@ def set_setting(line_user_id, field, value):
     if field not in allowed:
         raise ValueError("不支援的設定")
     with db_connect() as conn:
-        conn.execute("INSERT OR IGNORE INTO user_settings(line_user_id) VALUES(?)", (line_user_id,))
+        conn.execute("INSERT INTO user_settings(line_user_id) VALUES(?) ON CONFLICT(line_user_id) DO NOTHING", (line_user_id,))
         conn.execute(f"UPDATE user_settings SET {field}=? WHERE line_user_id=?", (value, line_user_id))
 
 
