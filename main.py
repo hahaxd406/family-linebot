@@ -416,9 +416,7 @@ def query_stats(period):
         lines.append(f"  **{main_type}合計：${total:,}**")
         lines.append("")
 
-    # 明確提醒：信用卡消費與實際繳卡費分開列示，不把兩者合併。
-    lines.append("ℹ️ 刷卡消費與「支出－交卡費」分開統計，避免混在一起。")
-    return "\n".join(lines)
+
 
 
 def query_people_stats():
