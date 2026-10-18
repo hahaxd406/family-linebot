@@ -42,8 +42,8 @@ GOOGLE_SCOPES = [
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 TW = datetime.timezone(datetime.timedelta(hours=8))
 
-# ===== 大項目與小項目 =====
-# 支出與刷卡使用相同的小項目；繳卡費屬於實際支出。
+# ===== 分類設定區：以後要新增、刪除或改分類，優先改這一區 =====
+# 支出與刷卡共用 EXPENSE_CATEGORIES；收入使用 INCOME_CATEGORIES。
 EXPENSE_CATEGORIES = [
     "餐飲", "交通", "生活", "醫療健康", "美容保養", "服飾",
     "訂閱服務", "娛樂休閒", "運動健身", "旅遊", "教育", "保險",
@@ -55,6 +55,28 @@ INCOME_CATEGORIES = [
     "補助", "兼職收入", "其他"
 ]
 MAIN_TYPES = ["支出", "收入", "刷卡"]
+
+# 自動分類關鍵字也集中在這裡；把關鍵字加進對應清單，就能調整自動歸類。
+CATEGORY_KEYWORDS = {
+    "收入": [
+        ("薪資", ["薪水", "薪資", "工資", "月薪"]),
+        ("獎金", ["獎金"]),
+        ("紅包", ["紅包"]),
+        ("退款", ["退款", "退費"]),
+        ("利息", ["利息"]),
+        ("投資收入", ["投資", "股息", "配息"]),
+    ],
+    "支出": [
+        ("繳卡費", ["交卡費", "繳卡費", "繳信用卡"]),
+        ("繳貸款", ["繳貸款", "貸款還款"]),
+        ("餐飲", ["食材", "食物", "食品", "生鮮", "蔬菜", "水果", "肉類", "海鮮", "零食", "點心", "飲料", "早餐", "午餐", "晚餐", "宵夜", "飯", "麵", "鍋", "滷味", "咖啡", "便當", "餐"]),
+        ("稅費", ["規費", "手續費", "辦理費", "地政", "戶政", "登記費", "代辦", "公證", "稅", "罰款"]),
+        ("交通", ["停車", "加油", "捷運", "公車", "火車", "高鐵", "計程車", "車資", "交通"]),
+        ("醫療健康", ["醫院", "診所", "藥", "看醫生", "掛號", "復健"]),
+        ("保險", ["保險"]),
+        ("訂閱服務", ["訂閱", "會員", "月費", "netflix", "spotify", "claude", "chatgpt"]),
+    ],
+}
 
 HEADERS = ["日期", "時間", "傳送者", "收支", "項目", "內容", "金額", "備註"]
 
@@ -330,40 +352,12 @@ def clean_main_prefix(text, main_type):
 
 
 def default_category(item, main_type):
+    """依上方 CATEGORY_KEYWORDS 集中設定的關鍵字，自動判斷小分類。"""
     s = item.lower()
-    if main_type == "收入":
-        if any(k in s for k in ["薪水", "薪資", "工資", "月薪"]):
-            return "薪資"
-        if "獎金" in s:
-            return "獎金"
-        if "紅包" in s:
-            return "紅包"
-        if "退款" in s or "退費" in s:
-            return "退款"
-        if "利息" in s:
-            return "利息"
-        if "投資" in s or "股息" in s or "配息" in s:
-            return "投資收入"
-        return "其他"
-
-    if "交卡費" in s or "繳卡費" in s or "繳信用卡" in s:
-        return "繳卡費"
-    if "繳貸款" in s or "貸款還款" in s:
-        return "繳貸款"
-    if any(k in s for k in ["食材", "食物", "食品", "生鮮", "蔬菜", "水果", "肉類",
-                             "海鮮", "零食", "點心", "飲料", "早餐", "午餐", "晚餐",
-                             "宵夜", "飯", "麵", "鍋", "滷味", "咖啡", "便當", "餐"]):
-        return "餐飲"
-    if any(k in s for k in ["規費", "手續費", "辦理費", "地政", "戶政", "登記費", "代辦", "公證", "稅", "罰款"]):
-        return "稅費"
-    if any(k in s for k in ["停車", "加油", "捷運", "公車", "火車", "高鐵", "計程車", "車資", "交通"]):
-        return "交通"
-    if any(k in s for k in ["醫院", "診所", "藥", "看醫生", "掛號", "復健"]):
-        return "醫療健康"
-    if any(k in s for k in ["保險"]):
-        return "保險"
-    if any(k in s for k in ["訂閱", "會員", "月費", "netflix", "spotify", "claude", "chatgpt"]):
-        return "訂閱服務"
+    group = "收入" if main_type == "收入" else "支出"
+    for category, keywords in CATEGORY_KEYWORDS[group]:
+        if any(keyword.lower() in s for keyword in keywords):
+            return category
     return "其他"
 
 
@@ -416,9 +410,7 @@ def parse_record(text):
 - amount 是金額整數。忽略金額中的逗號，例如 1,200 是 1200。
 - category 必須從這些類別選一個：{", ".join(categories)}
 - 支出與刷卡沿用相同小項目。
-- 含食材、食物、食品、生鮮、蔬菜、水果、肉類、海鮮、零食、點心、飲料、早餐、午餐、晚餐、宵夜、飯、麵、鍋、滷味、便當、咖啡等詞，歸「餐飲」。
-- 含規費、手續費、辦理費、地政、戶政、登記費、代辦、公證、稅、罰款等詞，歸「稅費」。
-- 停車、捷運、公車、加油、車資等交通項目，歸「交通」。
+- 自動分類時，優先參考程式上方「分類設定區」的分類名稱與關鍵字設定。
 - 「繳卡費／繳信用卡」若大項目是支出，類別選「繳卡費」。
 - 不要把刷卡消費當成支出；如果訊息開頭明確是「刷卡」，大項目已是刷卡。
 - 若沒有金額或不是記帳內容，回傳 {{"item":"","amount":0,"category":"其他"}}。
@@ -809,7 +801,7 @@ def link_google_flex_message(link_url):
 WELCOME_MESSAGE = """🎉 Google 帳號連結成功！💚
 🎊 歡迎使用「記帳小工具」！
 讓記帳變簡單，輕鬆掌握自己的每一筆錢！💰✨
-✨ 第一次使用，請先完成初始設定（也可略過）
+✨ 第一次使用，請輸入你的初始餘額設定
 👛 錢包餘額 1500
 🏦 帳戶餘額 25000
 💳 信用卡結算日 15
@@ -821,7 +813,7 @@ WELCOME_MESSAGE = """🎉 Google 帳號連結成功！💚
 • 繳卡費 5000：記錄信用卡繳費
 📅 忘記當天記帳也沒關係！可以使用「昨天」、「前天」或指定日期補記帳目。
 輸入「說明」：查看記帳小工具更多指令使用方式
-💚 初始設定完成後，就可以開始你的記帳生活囉！✨"""
+💚 輸入完成後，就可以開始你的記帳生活囉！✨"""
 
 HELP_MESSAGE = """📖 記帳小工具｜使用說明 💚
 
@@ -943,15 +935,8 @@ def handle_event(event):
                 reply_messages(reply_token, [link_google_flex_message(link_url)])
                 return
             spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{user_row['spreadsheet_id']}/edit"
-            if source.get("type") in {"group", "room"}:
-                # Never expose a personal financial spreadsheet link to the whole group.
-                delivered = push_message(line_user_id, f"📒 這是你自己的記帳試算表：\n{spreadsheet_url}")
-                if delivered:
-                    reply_message(reply_token, "📩 已將你的個人記帳試算表連結私訊給你，請查看 LINE 私訊。")
-                else:
-                    reply_message(reply_token, "⚠️ 無法私訊你的帳本連結。請先加入記帳小工具官方帳號好友，再輸入「帳本」取得連結。")
-            else:
-                reply_message(reply_token, f"📒 這是你自己的記帳試算表：\n{spreadsheet_url}")
+            # 依使用者需求，直接在目前對話（包含群組）回覆帳本連結，不使用私訊功能。
+            reply_message(reply_token, f"📒 這是你的記帳試算表連結：\n{spreadsheet_url}")
         except Exception as e:
             reply_message(reply_token, f"⚠️ 目前無法取得你的帳本連結，請稍後再試。\n原因：{str(e)[:160]}")
         return
@@ -1048,12 +1033,13 @@ def auth_callback():
         flow.fetch_token(code=code)
         creds = flow.credentials
         spreadsheet_url = create_user_spreadsheet(creds, line_user_id)
-        # 將已確認的歡迎詞私訊給完成授權的使用者，不在群組曝光個人帳本連結。
-        push_message(line_user_id, WELCOME_MESSAGE)
-        return ("<html><meta charset='utf-8'><body style='font-family:sans-serif;padding:24px'>"
+        # 不使用私訊功能；授權成功頁面直接顯示歡迎與初始設定提示。
+        welcome_html = WELCOME_MESSAGE.replace("\n", "<br>")
+        return ("<html><meta charset='utf-8'><body style='font-family:sans-serif;padding:24px;line-height:1.8'>"
                 "<h2>✅ Google 帳號連結成功！</h2>"
-                "<p>已建立你的專屬記帳試算表。你可以關閉此頁，回到 LINE 開始記帳。</p>"
+                f"<p>{welcome_html}</p>"
                 f"<p><a href='{spreadsheet_url}' target='_blank' rel='noopener'>開啟我的 Google 試算表</a></p>"
+                "<p>接著回到 LINE 群組，就可以開始記帳。</p>"
                 "</body></html>")
     except Exception as e:
         sys.stdout.write(f"[OAUTH] 授權完成但建立試算表失敗：{e}\n")
@@ -1085,18 +1071,8 @@ def push_long_message(line_user_id, text):
 
 
 def respond_personal_text(reply_token, line_user_id, source, text, long_text=False):
-    """Keep transaction amounts and personal financial details out of group/room chats."""
-    source_type = (source or {}).get("type", "")
-    if source_type in {"group", "room"}:
-        if long_text:
-            delivered = push_long_message(line_user_id, text)
-        else:
-            delivered = push_message(line_user_id, text)
-        if delivered:
-            reply_message(reply_token, "📩 已將你的個人記帳結果私訊給你，請查看 LINE 私訊。")
-        else:
-            reply_message(reply_token, "⚠️ 無法私訊你的個人記帳結果。請先加入記帳小工具官方帳號好友，再重新查詢；群組不會顯示個人財務明細。")
-    elif long_text:
+    """直接回覆目前對話；不依賴 LINE 私訊或官方帳號好友關係。"""
+    if long_text:
         reply_long_message(reply_token, text)
     else:
         reply_message(reply_token, text)
