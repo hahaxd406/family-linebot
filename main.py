@@ -786,9 +786,13 @@ def handle_event(event):
 
     # 所有功能共用管理員指定的試算表，但每個 LINE 使用者只操作自己的工作表。
     if not user_is_linked(line_user_id):
-        # 一般閒聊不提示設定錯誤，避免群組洗版；明確指令才顯示設定提示。
-        if text in {"今日", "今天", "/今日", "/today", "本月", "/本月", "/month", "統計", "/統計", "/stats", "刪除", "刪除上一筆", "刪除上一筆記帳", "帳本"} or re.match(r"^(錢包餘額|帳戶餘額|信用卡結算日)\s*[:：]?\s*\d+$", text):
-            reply_message(reply_token, "⚠️ 記帳機器人尚未完成設定，請確認 Render 已設定 GOOGLE_SHEET_ID、GOOGLE_CREDENTIALS_JSON 和 DATABASE_URL。")
+        # 一般閒聊不提示設定錯誤，避免群組洗版；但記帳格式必須明確告知原因，不能靜默忽略。
+        setup_commands = {"今日", "今天", "/今日", "/today", "本月", "/本月", "/month", "統計", "/統計", "/stats", "刪除", "刪除上一筆", "刪除上一筆記帳", "帳本"}
+        is_balance_setting = re.match(r"^(錢包餘額|帳戶餘額|信用卡結算日)\s*[:：]?\s*\d+$", text)
+        is_record_like = bool(re.search(r"\d[\d,]*\s*(?:元|塊|塊錢)?\s*$", text))
+        if text in setup_commands or is_balance_setting or is_record_like:
+            sys.stdout.write("[CONFIG] 未記帳：GOOGLE_SHEET_ID、GOOGLE_CREDENTIALS_JSON 或 DATABASE_URL 未完整設定\n")
+            reply_message(reply_token, "⚠️ 記帳機器人尚未完成設定，這筆還沒有記錄。請確認 Render 的 GOOGLE_SHEET_ID、GOOGLE_CREDENTIALS_JSON、DATABASE_URL 都已設定，再重新記帳。")
         return
 
     setting_match = re.fullmatch(r"(錢包餘額|帳戶餘額|信用卡結算日)\s*[:：]?\s*(\d+)", text)
