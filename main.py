@@ -8,7 +8,6 @@ import hmac
 import base64
 import hashlib
 import datetime
-import calendar
 import threading
 import psycopg
 from psycopg.rows import dict_row
@@ -18,7 +17,8 @@ from urllib.parse import quote
 import requests as req
 import gspread
 from flask import Flask, request
-from google.oauth2.service_account import Credentials as ServiceAccountCredentials
+from google.oauth2.credentials import Credentials as UserCredentials
+from google_auth_oauthlib.flow import Flow
 from openai import OpenAI
 
 app = Flask(__name__)
@@ -28,8 +28,11 @@ LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
-GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
-OWNER_LINE_USER_ID = os.environ.get("OWNER_LINE_USER_ID", "").strip()
+GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")  # Google 服務帳戶 JSON（完整 JSON 文字）
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+BASE_URL = os.environ.get("BASE_URL", "https://family-linebot-mv4v.onrender.com").rstrip("/")
+OAUTH_REDIRECT_URI = os.environ.get("OAUTH_REDIRECT_URI", f"{BASE_URL}/auth/callback")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/drive.file",
@@ -53,7 +56,7 @@ INCOME_CATEGORIES = [
 ]
 MAIN_TYPES = ["支出", "收入", "刷卡"]
 
-HEADERS = ["日期", "時間", "傳送者", "收支", "項目", "內容", "金額", "備註"]
+HEADERS = ["日期", "時間", "記錄人", "收支", "項目", "內容", "金額", "備註"]
 
 
 def now_tw():
@@ -91,11 +94,11 @@ def db_connect():
 
 def init_db():
     with db_connect() as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS user_sheets (
+        conn.execute("""CREATE TABLE IF NOT EXISTS users (
             line_user_id TEXT PRIMARY KEY,
-            display_name TEXT NOT NULL,
-            worksheet_title TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            credentials_json TEXT NOT NULL,
+            spreadsheet_id TEXT NOT NULL,
+            linked_at TEXT NOT NULL
         )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS oauth_sessions (
             state TEXT PRIMARY KEY,
@@ -112,98 +115,159 @@ def init_db():
             line_user_id TEXT PRIMARY KEY,
             wallet_balance INTEGER NOT NULL DEFAULT 0,
             account_balance INTEGER NOT NULL DEFAULT 0,
-            statement_day INTEGER NOT NULL DEFAULT 15,
-            wallet_initialized INTEGER NOT NULL DEFAULT 0,
-            account_initialized INTEGER NOT NULL DEFAULT 0
+            statement_day INTEGER NOT NULL DEFAULT 15
         )""")
-        conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS wallet_initialized INTEGER NOT NULL DEFAULT 0")
-        conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS account_initialized INTEGER NOT NULL DEFAULT 0")
         conn.execute("""CREATE TABLE IF NOT EXISTS transaction_meta (
             line_user_id TEXT NOT NULL,
             sheet_row INTEGER NOT NULL,
             payment_method TEXT NOT NULL DEFAULT 'bank',
             PRIMARY KEY(line_user_id, sheet_row)
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS user_profiles (
+            line_user_id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            worksheet_title TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
+        # 舊資料庫相容：補上初始餘額是否已寫入帳本的旗標
+        for column in ("wallet_initial_recorded", "account_initial_recorded"):
+            try:
+                conn.execute(f"ALTER TABLE user_settings ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
+            except Exception:
+                pass
 
 
-def service_account_credentials():
-    """Use the owner's Google service account to access one shared spreadsheet."""
-    if not GOOGLE_CREDENTIALS_JSON:
-        raise RuntimeError("Render 尚未設定 GOOGLE_CREDENTIALS_JSON（Google 服務帳戶 JSON）")
-    try:
-        info = json.loads(GOOGLE_CREDENTIALS_JSON)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("GOOGLE_CREDENTIALS_JSON 不是有效的 JSON") from exc
-    return ServiceAccountCredentials.from_service_account_info(
-        info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    )
+def oauth_client_config():
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        raise RuntimeError("Render 尚未設定 GOOGLE_CLIENT_ID 或 GOOGLE_CLIENT_SECRET")
+    return {"web": {
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "redirect_uris": [OAUTH_REDIRECT_URI],
+    }}
 
 
 def get_user_row(line_user_id):
     with db_connect() as conn:
-        return conn.execute("SELECT * FROM user_sheets WHERE line_user_id=?", (line_user_id,)).fetchone()
+        return conn.execute("SELECT * FROM users WHERE line_user_id=?", (line_user_id,)).fetchone()
 
 
 def user_is_linked(line_user_id):
-    # A user is ready when the shared spreadsheet and service account are configured.
-    return bool(GOOGLE_SHEET_ID and GOOGLE_CREDENTIALS_JSON and line_user_id)
+    # 共用試算表模式：所有 LINE 使用者共用管理員設定的同一份試算表。
+    return bool(GOOGLE_SHEET_ID and GOOGLE_CREDENTIALS_JSON and DATABASE_URL)
 
 
-def safe_worksheet_title(name):
-    name = re.sub(r"[\[\]:*?/\\]", "", (name or "LINE 使用者")).strip()
-    name = name[:90] or "LINE 使用者"
-    return name
+def shared_google_client():
+    if not GOOGLE_SHEET_ID:
+        raise RuntimeError("Render 尚未設定 GOOGLE_SHEET_ID（共用試算表 ID）")
+    if not GOOGLE_CREDENTIALS_JSON:
+        raise RuntimeError("Render 尚未設定 GOOGLE_CREDENTIALS_JSON（Google 服務帳戶 JSON）")
+    try:
+        info = json.loads(GOOGLE_CREDENTIALS_JSON)
+    except json.JSONDecodeError as e:
+        raise RuntimeError("GOOGLE_CREDENTIALS_JSON 不是有效的 JSON，請貼上完整服務帳戶 JSON") from e
+    creds = gspread.service_account_from_dict(info)
+    return gspread.authorize(creds)
+
+
+def safe_worksheet_title(display_name, user_id):
+    name = re.sub(r"[\[\]:*?/\\]", " ", (display_name or "LINE使用者")).strip().strip("'")
+    name = re.sub(r"\s+", " ", name)[:70] or "LINE使用者"
+    # 同名者用 ID 後四碼區分，避免兩人共用同一張工作表。
+    suffix = str(user_id)[-4:]
+    return f"{name}_{suffix}"[:100]
 
 
 def get_sheet(line_user_id):
-    """Open the shared spreadsheet and only this LINE user's worksheet."""
-    if not GOOGLE_SHEET_ID:
-        raise RuntimeError("Render 尚未設定 GOOGLE_SHEET_ID（共用試算表 ID）")
-    gc = gspread.authorize(service_account_credentials())
+    """開啟共用試算表中該 LINE 使用者專屬的工作表。"""
+    if not line_user_id:
+        raise RuntimeError("無法辨識 LINE 使用者 ID")
+    gc = shared_google_client()
     sh = gc.open_by_key(GOOGLE_SHEET_ID)
-    row = get_user_row(line_user_id)
-    if not row:
-        raise RuntimeError("尚未建立個人工作表，請重新傳送一次指令。")
-    title = row["worksheet_title"]
+    with db_connect() as conn:
+        profile = conn.execute("SELECT display_name,worksheet_title FROM user_profiles WHERE line_user_id=?", (line_user_id,)).fetchone()
+    if profile:
+        title = profile["worksheet_title"]
+    else:
+        display_name = get_sender_name(line_user_id, {})
+        title = safe_worksheet_title(display_name, line_user_id)
+        with db_connect() as conn:
+            # 若名稱重複，以 ID 後四碼作為工作表名稱的一部分。
+            conn.execute("INSERT INTO user_profiles(line_user_id,display_name,worksheet_title,created_at) VALUES(?,?,?,?) ON CONFLICT(line_user_id) DO NOTHING",
+                         (line_user_id, display_name, title, now_tw().isoformat()))
+            stored = conn.execute("SELECT worksheet_title FROM user_profiles WHERE line_user_id=?", (line_user_id,)).fetchone()
+            title = stored["worksheet_title"]
     try:
         ws = sh.worksheet(title)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=title, rows="3000", cols="8")
+        ws = sh.add_worksheet(title=title, rows="2000", cols=str(len(HEADERS)))
         ws.update("A1", [HEADERS])
     values = ws.get_all_values()
     if not values:
         ws.update("A1", [HEADERS])
     elif values[0] != HEADERS:
-        raise RuntimeError(f"工作表「{title}」欄位與程式不一致，請先備份後再處理。")
+        # 舊版工作表若有「記錄人」欄，安全地只改標題，不清除資料。
+        if values[0] and values[0][0:2] == ["日期", "時間"] and "傳送者" in values[0]:
+            idx = values[0].index("傳送者")
+            ws.update_cell(1, idx + 1, "記錄人")
+        else:
+            raise RuntimeError(f"工作表「{title}」欄位與程式不一致，請先備份後再處理。")
     return ws
 
-
-def ensure_user_sheet(line_user_id, display_name):
-    """Map stable LINE user ID to a worksheet named after their LINE display name."""
-    display_name = (display_name or "LINE 使用者").strip()[:80] or "LINE 使用者"
-    existing = get_user_row(line_user_id)
-    if existing:
-        if existing["display_name"] != display_name:
-            # Keep worksheet identity stable even if display name changes; update label only.
-            with db_connect() as conn:
-                conn.execute("UPDATE user_sheets SET display_name=? WHERE line_user_id=?", (display_name, line_user_id))
-        return existing["worksheet_title"]
-    gc = gspread.authorize(service_account_credentials())
-    sh = gc.open_by_key(GOOGLE_SHEET_ID)
-    base = safe_worksheet_title(display_name)
-    title = base
-    suffix = 2
-    existing_titles = {w.title for w in sh.worksheets()}
-    while title in existing_titles:
-        title = safe_worksheet_title(f"{base[:85]} ({suffix})")
-        suffix += 1
+def create_link_token(line_user_id):
+    token = secrets.token_urlsafe(32)
+    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
     with db_connect() as conn:
-        conn.execute("INSERT INTO user_sheets(line_user_id,display_name,worksheet_title,created_at) VALUES(?,?,?,?)",
-                     (line_user_id, display_name, title, now_tw().isoformat()))
-    ws = sh.add_worksheet(title=title, rows="3000", cols="8")
+        conn.execute("INSERT INTO link_tokens(token,line_user_id,expires_at,used) VALUES(?,?,?,0)",
+                     (token, line_user_id, now + 600))
+    return token
+
+
+def consume_link_token(token):
+    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+    with db_connect() as conn:
+        row = conn.execute("SELECT line_user_id,expires_at,used FROM link_tokens WHERE token=?", (token,)).fetchone()
+        if not row or row["used"] or row["expires_at"] < now:
+            return None
+        conn.execute("UPDATE link_tokens SET used=1 WHERE token=?", (token,))
+        return row["line_user_id"]
+
+
+def save_oauth_session(state, line_user_id):
+    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+    with db_connect() as conn:
+        conn.execute("""INSERT INTO oauth_sessions(state,line_user_id,created_at) VALUES(?,?,?)
+                     ON CONFLICT(state) DO UPDATE SET line_user_id=EXCLUDED.line_user_id,
+                     created_at=EXCLUDED.created_at""", (state, line_user_id, now))
+
+
+def consume_oauth_session(state):
+    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+    with db_connect() as conn:
+        row = conn.execute("SELECT line_user_id,created_at FROM oauth_sessions WHERE state=?", (state,)).fetchone()
+        conn.execute("DELETE FROM oauth_sessions WHERE state=?", (state,))
+        if not row or now - int(row["created_at"]) > 600:
+            return None
+        return row["line_user_id"]
+
+
+def create_user_spreadsheet(creds, line_user_id):
+    gc = gspread.authorize(creds)
+    sh = gc.create("記帳小工具｜我的記帳")
+    ws = sh.sheet1
+    ws.update_title("記帳")
     ws.update("A1", [HEADERS])
-    return title
+    # 將 token 與這位 LINE 使用者的試算表 ID 存在 Render 資料庫。
+    with db_connect() as conn:
+        conn.execute("""INSERT INTO users(line_user_id,credentials_json,spreadsheet_id,linked_at)
+            VALUES(?,?,?,?) ON CONFLICT(line_user_id) DO UPDATE SET
+            credentials_json=EXCLUDED.credentials_json,
+            spreadsheet_id=EXCLUDED.spreadsheet_id,
+            linked_at=EXCLUDED.linked_at""",
+            (line_user_id, creds.to_json(), sh.id, now_tw().isoformat()))
+    return sh.url
 
 
 def parse_date_hint(text):
@@ -227,7 +291,7 @@ def parse_date_hint(text):
         target = today
 
     # 支援 2026/10/15、2026-10-15、2026.10.15
-    match = re.search(r"(?<!\d)(20\d{2})[./-](\d{1,2})[./-](\d{1,2})(?!\d)", cleaned)
+    match = re.search(r"(?<!\d)(20\d{2})[/.\-](\d{1,2})[/.\-](\d{1,2})(?!\d)", cleaned)
     if match:
         try:
             target = datetime.date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
@@ -244,7 +308,7 @@ def parse_date_hint(text):
             except ValueError:
                 pass
 
-    # Time is metadata, not a category prefix. Remove it even when it follows a date.
+    # 日期旁的時間只作為時間提示，不得卡在「刷卡／收入」前面影響大項目判斷。
     cleaned = re.sub(r"(?<!\d)\d{1,2}:\d{2}(?!\d)", " ", cleaned)
     cleaned = re.sub(r"^\s*(的|那天|當天)+", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" ，,。:：")
@@ -322,9 +386,7 @@ def default_category(item, main_type):
 
 def fallback_parse(text):
     """OpenAI 無法使用時的基本備援：抓最後一個金額，避免完全不能記帳。"""
-    # Remove a leading clock time (e.g. 18:05) before classifying the transaction.
-    time_cleaned = re.sub(r"^\s*\d{1,2}:\d{2}\s+", "", text)
-    target_date, cleaned = parse_date_hint(time_cleaned)
+    target_date, cleaned = parse_date_hint(text)
     main_type = infer_main_type(cleaned)
     cleaned = clean_main_prefix(cleaned, main_type)
     match = re.search(r"^(.*?)[\s$＄,，:：|｜-]*(\d[\d,]*)\s*(元|塊|塊錢)?$", cleaned)
@@ -348,9 +410,7 @@ def fallback_parse(text):
 
 def parse_record(text):
     """用 AI 理解自然語言；日期先由程式規則處理，AI 只協助判斷項目與類別。"""
-    # Remove a leading clock time (e.g. 18:05) before classifying the transaction.
-    time_cleaned = re.sub(r"^\s*\d{1,2}:\d{2}\s+", "", text)
-    target_date, cleaned = parse_date_hint(time_cleaned)
+    target_date, cleaned = parse_date_hint(text)
     main_type = infer_main_type(cleaned)
     cleaned = clean_main_prefix(cleaned, main_type)
 
@@ -437,12 +497,18 @@ def get_sender_name(user_id, source):
                 display_name = str(response.json().get("displayName", "")).strip()
                 if display_name:
                     _SENDER_NAME_CACHE[user_id] = display_name
+                    try:
+                        with db_connect() as conn:
+                            conn.execute("INSERT INTO user_profiles(line_user_id,display_name,worksheet_title,created_at) VALUES(?,?,?,?) ON CONFLICT(line_user_id) DO UPDATE SET display_name=EXCLUDED.display_name",
+                                         (user_id, display_name, safe_worksheet_title(display_name, user_id), now_tw().isoformat()))
+                    except Exception as db_error:
+                        sys.stdout.write(f"[PROFILE DB] 更新名稱失敗：{db_error}\n")
                     return display_name
         except Exception as e:
             sys.stdout.write(f"[LINE PROFILE] 取得名稱失敗：{e}\n")
 
-    # 若 LINE API 無法取得顯示名稱，不把 Uxxxx ID 寫進表格。
-    return "未知使用者"
+    # API 暫時取不到名稱時先用中性名稱，之後再次成功取得 Profile 時會更新。
+    return "LINE使用者"
 
 
 def get_records(line_user_id):
@@ -459,12 +525,18 @@ def get_records(line_user_id):
             main_type = str(row.get("收支", "支出")).strip() or "支出"
             if main_type not in MAIN_TYPES:
                 main_type = "支出"
-            result.append({"日期": date_str, "時間": str(row.get("時間", "")),
-                "傳送者": str(row.get("傳送者", "未知使用者")), "大項目": main_type,
-                "項目": str(row.get("內容", "")), "金額": amount,
+            result.append({
+                "日期": date_str,
+                "時間": str(row.get("時間", "")),
+                "記錄人": str(row.get("記錄人", row.get("傳送者", "未知使用者"))),
+                "大項目": main_type,
+                "項目": str(row.get("內容", "")),
+                "金額": amount,
                 "小項目": str(row.get("項目", "其他")) or "其他",
-                "備註": str(row.get("備註", "")), "_sheet_row": sheet_row,
-                "付款方式": methods.get(sheet_row, "bank")})
+                "備註": str(row.get("備註", "")),
+                "_sheet_row": sheet_row,
+                "付款方式": methods.get(sheet_row, "bank"),
+            })
         except (ValueError, TypeError):
             continue
     return result
@@ -484,30 +556,14 @@ def cumulative_label(main_type):
 def save_record(line_user_id, sender, record, payment_method="bank"):
     ws = get_sheet(line_user_id)
     sheet_row = len(ws.get_all_values()) + 1
-    ws.append_row([record["date"], now_tw().strftime("%H:%M"), sender, record["main_type"],
-                   record["category"], record["item"], record["amount"], ""], value_input_option="USER_ENTERED")
+    ws.append_row([
+        record["date"], now_tw().strftime("%H:%M"), sender, record["main_type"],
+        record["category"], record["item"], record["amount"], ""
+    ], value_input_option="USER_ENTERED")
     with db_connect() as conn:
         conn.execute("""INSERT INTO transaction_meta(line_user_id,sheet_row,payment_method) VALUES(?,?,?)
                      ON CONFLICT(line_user_id,sheet_row) DO UPDATE SET payment_method=EXCLUDED.payment_method""",
                      (line_user_id, sheet_row, payment_method))
-
-
-def add_initial_balance(line_user_id, sender, balance_type, amount):
-    """Write each initial balance as a one-time income row; excluded from monthly totals by date label."""
-    ws = get_sheet(line_user_id)
-    col = "wallet_initialized" if balance_type == "wallet_balance" else "account_initialized"
-    with db_connect() as conn:
-        conn.execute("INSERT INTO user_settings(line_user_id) VALUES(?) ON CONFLICT(line_user_id) DO NOTHING", (line_user_id,))
-        setting = conn.execute(f"SELECT {col} FROM user_settings WHERE line_user_id=?", (line_user_id,)).fetchone()
-        if setting and int(setting[col]) == 1:
-            return False
-        sheet_row = len(ws.get_all_values()) + 1
-        label = "初始錢包餘額" if balance_type == "wallet_balance" else "初始帳戶餘額"
-        ws.append_row(["初始設定", now_tw().strftime("%H:%M"), sender, "收入", "其他", label, amount, "初始餘額"], value_input_option="USER_ENTERED")
-        conn.execute("UPDATE user_settings SET " + col + "=1 WHERE line_user_id=?", (line_user_id,))
-        conn.execute("INSERT INTO transaction_meta(line_user_id,sheet_row,payment_method) VALUES(?,?,?) ON CONFLICT(line_user_id,sheet_row) DO UPDATE SET payment_method=EXCLUDED.payment_method",
-                     (line_user_id, sheet_row, "initial"))
-    return True
 
 
 def query_stats(line_user_id, period):
@@ -551,25 +607,20 @@ def query_stats(line_user_id, period):
 
 
 def delete_latest_record(line_user_id):
+    """每個使用者只有自己的試算表，因此只會刪除自己的最後一筆。"""
     ws = get_sheet(line_user_id)
     rows = ws.get_all_records()
     if not rows:
         return "目前找不到你新增的記帳資料。"
-    # Delete only a transaction created by this user; skip initial balance rows.
-    for idx in range(len(rows)-1, -1, -1):
-        row = rows[idx]
-        if str(row.get("日期", "")) == "初始設定" or str(row.get("備註", "")) == "初始餘額":
-            continue
-        sheet_row_number = idx + 2
-        item = str(row.get("內容", "未命名項目"))
-        amount = str(row.get("金額", "0"))
-        main_type = str(row.get("收支", "支出"))
-        ws.delete_rows(sheet_row_number)
-        with db_connect() as conn:
-            conn.execute("DELETE FROM transaction_meta WHERE line_user_id=? AND sheet_row=?", (line_user_id, sheet_row_number))
-            conn.execute("UPDATE transaction_meta SET sheet_row=sheet_row-1 WHERE line_user_id=? AND sheet_row>?", (line_user_id, sheet_row_number))
-        return f"🗑️ 已刪除上一筆：{main_type}｜{item} ${amount}"
-    return "目前找不到可刪除的記帳資料。"
+    row = rows[-1]
+    sheet_row_number = len(rows) + 1
+    item = str(row.get("內容", "未命名項目"))
+    amount = str(row.get("金額", "0"))
+    main_type = str(row.get("收支", "支出"))
+    ws.delete_rows(sheet_row_number)
+    with db_connect() as conn:
+        conn.execute("DELETE FROM transaction_meta WHERE line_user_id=? AND sheet_row=?", (line_user_id, sheet_row_number))
+    return f"🗑️ 已刪除上一筆：{main_type}｜{item} ${amount}"
 
 
 def get_settings(line_user_id):
@@ -577,6 +628,19 @@ def get_settings(line_user_id):
         conn.execute("INSERT INTO user_settings(line_user_id) VALUES(?) ON CONFLICT(line_user_id) DO NOTHING", (line_user_id,))
         row = conn.execute("SELECT * FROM user_settings WHERE line_user_id=?", (line_user_id,)).fetchone()
         return dict(row)
+
+
+def record_initial_balance(line_user_id, sender, kind, amount):
+    """將初始錢包／帳戶金額記入個人工作表的累積收入；使用特殊日期避免算入當月收入。"""
+    field = "wallet_initial_recorded" if kind == "錢包" else "account_initial_recorded"
+    settings = get_settings(line_user_id)
+    if int(settings.get(field, 0)):
+        return False
+    record = {"date": "初始設定", "main_type": "收入", "item": f"初始{kind}餘額", "amount": int(amount), "category": "其他"}
+    save_record(line_user_id, sender, record, "bank")
+    with db_connect() as conn:
+        conn.execute(f"UPDATE user_settings SET {field}=1 WHERE line_user_id=?", (line_user_id,))
+    return True
 
 
 def set_setting(line_user_id, field, value):
@@ -609,6 +673,7 @@ def cycle_start(today, statement_day):
 
 
 def query_people_stats(line_user_id):
+    """顯示個人累積收支、現金／帳戶估算餘額與本期刷卡金額。"""
     try:
         records = get_records(line_user_id)
         settings = get_settings(line_user_id)
@@ -619,7 +684,7 @@ def query_people_stats(line_user_id):
     today = now_tw().date()
     start = cycle_start(today, int(settings["statement_day"]))
     card_total = sum(r["金額"] for r in records if r["大項目"] == "刷卡"
-                     and len(r["日期"]) >= 10 and start.isoformat() <= r["日期"] <= today.isoformat())
+                     and r["日期"][:10] and start.isoformat() <= r["日期"][:10] <= today.isoformat())
     balance = total_income - total_expense
     return (f"📊 個人財務統計\n\n"
             f"💵 累積收入：${total_income:,}\n"
@@ -665,30 +730,80 @@ def link_google_flex_message(link_url):
     }}
 
 
-WELCOME_MESSAGE = """🎉 歡迎使用記帳小工具！
+WELCOME_MESSAGE = """🎉 歡迎使用「記帳小工具」！💚
 
-先設定：
-• 錢包餘額 1500
-• 帳戶餘額 25000
-• 信用卡結算日 15
+讓記帳變簡單，輕鬆掌握自己的每一筆錢！
 
-記帳範例：
-• 午餐 100
-• 刷卡 買衣服 890
-• 收入 薪水 28000
-• 繳貸款 5704
-• 繳卡費 5000
+✨ 第一次使用，請先完成初始設定
 
-查詢：今日、本月、統計、帳本
-補記：昨天 午餐 100 或 2026/10/16 18:05 刷卡 寶雅 495
-刪除：刪除
-只有記帳指令會回覆，一般聊天不會插話。"""
+👛 錢包餘額：目前身上有多少現金
+例如：錢包餘額 1500
 
-HELP_MESSAGE = WELCOME_MESSAGE
+🏦 帳戶餘額：目前銀行帳戶裡有多少錢
+例如：帳戶餘額 25000
+
+💳 信用卡結算日：信用卡的結算日期
+例如：信用卡結算日 15
+
+📝 記帳超簡單
+
+• 午餐 100：記錄一般支出（預設從銀行帳戶扣除）
+• 刷卡 買衣服 890：記錄信用卡消費
+• 收入 薪水 28000：記錄收入
+• 繳貸款 5704：記錄貸款繳費
+• 繳卡費 5000：記錄信用卡繳費
+
+📅 忘記當天記帳也沒關係！支援昨天、前天及指定日期，輕鬆補記帳目。
+
+📊 小工具指令說明
+
+• 今日：查看今天的收支與刷卡明細
+• 本月：查看本月的收支與刷卡明細
+• 統計：查看累積收入、累積支出、目前餘額及本期已刷金額
+• 說明：查看完整使用方式
+• 刪除：刪除自己最近一筆記帳
+
+💚 直接在群組開始記帳即可！✨"""
+
+HELP_MESSAGE = """📖 記帳小工具｜使用說明 💚
+
+📝 一、如何記帳
+
+直接輸入項目和金額即可：
+
+• 午餐 100：記錄一般支出（預設從銀行帳戶扣除）
+• 刷卡 買衣服 890：記錄信用卡消費
+• 收入 薪水 28000：記錄收入
+• 繳貸款 5704：記錄貸款繳費
+• 繳卡費 5000：記錄信用卡繳費
+
+📅 二、日期設定與補記
+
+忘記當天記帳也沒關係，可以指定日期：
+
+• 午餐 100：記錄今天的午餐
+• 昨天 午餐 100：記錄昨天的午餐
+• 前天 買衣服 890：記錄前天的消費
+• 2026/10/15 晚餐 150：記錄指定日期的晚餐
+
+📊 三、小工具指令
+
+• 今日：查看今天的收支與刷卡明細
+• 本月：查看本月的收支與刷卡明細
+• 統計：查看累積收入、累積支出、目前餘額及本期已刷金額
+• 說明：查看完整使用方式
+• 刪除：刪除自己最近一筆記帳
+
+💚 記帳就是這麼簡單！祝你每天都能輕鬆掌握自己的財務狀況！✨"""
 
 
 def welcome_flex():
-    return {"type": "text", "text": WELCOME_MESSAGE}
+    return {"type": "flex", "altText": "歡迎使用記帳小工具", "contents": {
+        "type": "bubble", "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
+            {"type": "text", "text": WELCOME_MESSAGE, "wrap": True, "size": "sm"}
+        ]},
+"footer": {"type": "box", "layout": "vertical", "contents": []}
+    }}
 
 
 def handle_event(event):
@@ -699,43 +814,62 @@ def handle_event(event):
 
     if event_type == "join":
         reply_messages(reply_token, [welcome_flex()])
+        sys.stdout.write("[WELCOME] 已送出加入聊天室歡迎詞\n")
         return
+
+    if event_type == "postback":
+        data = (event.get("postback") or {}).get("data", "")
+        if data == "action=google_link":
+            if not line_user_id:
+                reply_message(reply_token, "⚠️ 無法辨識你的 LINE 帳號，請在群組內重新點選。")
+                return
+            token = create_link_token(line_user_id)
+            link_url = f"{BASE_URL}/auth/start?link_token={quote(token)}"
+            reply_messages(reply_token, [link_google_flex_message(link_url)])
+        return
+
     if event_type != "message":
         return
     msg = event.get("message", {})
-    if msg.get("type") != "text" or not line_user_id:
+    if msg.get("type") != "text":
         return
     text = msg.get("text", "").strip()
+    if not line_user_id:
+        reply_message(reply_token, "⚠️ 無法辨識你的 LINE 帳號，請重新傳送訊息。")
+        return
     sender = get_sender_name(line_user_id, source)
-    sys.stdout.write(f"[MSG] {text!r} from {sender} ({line_user_id})\n")
+    sys.stdout.write(f"[MSG] {text!r} from {sender}\n")
 
-    # Only the configured owner can trigger the reminder.
-    if text == "我的LINE ID":
-        reply_message(reply_token, f"你的 LINE 使用者 ID：\n{line_user_id}")
+    # 兩位使用者都可以手動觸發提醒。
+    if text == "提醒":
+        reply_message(reply_token, "兄弟！該記帳了")
         return
 
-    if text == "提醒":
-        if OWNER_LINE_USER_ID and line_user_id == OWNER_LINE_USER_ID:
-            reply_message(reply_token, "兄弟！該記帳了")
+    if text == "帳本":
+        if not GOOGLE_SHEET_ID:
+            reply_message(reply_token, "⚠️ 共用試算表尚未設定，請檢查管理員的 GOOGLE_SHEET_ID。")
+        else:
+            try:
+                ws = get_sheet(line_user_id)
+                reply_message(reply_token, f"📒 這是你的工作表：{ws.title}\nhttps://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/edit#gid={ws.id}")
+            except Exception as e:
+                reply_message(reply_token, f"⚠️ 暫時無法取得帳本連結：{str(e)[:150]}")
+        return
+
+    # 舊版 OAuth 指令不再需要；不回覆連結授權流程。
+    if text in ["連結 Google 帳號", "連結Google", "Google連結", "重新連結 Google 帳號"]:
+        reply_message(reply_token, "💚 這個版本使用共用試算表，不需要個別連結 Google 帳號。")
         return
 
     if text in ["說明", "/說明", "help", "/help"]:
         reply_message(reply_token, HELP_MESSAGE)
         return
 
+    # 所有功能共用管理員指定的試算表，但每個 LINE 使用者只操作自己的工作表。
     if not user_is_linked(line_user_id):
-        # Only respond to commands that clearly intend to use the bookkeeping bot.
-        if text in {"今日", "今天", "本月", "統計", "帳本", "刪除", "刪除上一筆", "刪除上一筆記帳"} or re.match(r"^(錢包餘額|帳戶餘額|信用卡結算日)\s*[:：]?\s*\d+$", text):
-            reply_message(reply_token, "⚠️ 記帳機器人尚未完成試算表設定，請檢查管理員的 Google 服務帳戶與 GOOGLE_SHEET_ID 設定。")
-        return
-
-    # Create a worksheet per LINE user ID; worksheet label uses LINE display name.
-    try:
-        ensure_user_sheet(line_user_id, sender)
-    except Exception as e:
-        sys.stdout.write(f"[SHEETS INIT] {e}\n")
-        if text in {"今日", "今天", "本月", "統計", "帳本", "刪除", "刪除上一筆", "刪除上一筆記帳"} or re.search(r"\d", text):
-            reply_message(reply_token, f"⚠️ 試算表尚未就緒，請檢查設定。")
+        # 一般閒聊不提示設定錯誤，避免群組洗版；明確指令才顯示設定提示。
+        if text in {"今日", "今天", "/今日", "/today", "本月", "/本月", "/month", "統計", "/統計", "/stats", "刪除", "刪除上一筆", "刪除上一筆記帳", "帳本"} or re.match(r"^(錢包餘額|帳戶餘額|信用卡結算日)\s*[:：]?\s*\d+$", text):
+            reply_message(reply_token, "⚠️ 記帳機器人尚未完成設定，請確認 Render 已設定 GOOGLE_SHEET_ID、GOOGLE_CREDENTIALS_JSON 和 DATABASE_URL。")
         return
 
     setting_match = re.fullmatch(r"(錢包餘額|帳戶餘額|信用卡結算日)\s*[:：]?\s*(\d+)", text)
@@ -747,24 +881,14 @@ def handle_event(event):
                 reply_message(reply_token, "信用卡結算日請輸入 1～31 的數字。")
                 return
             set_setting(line_user_id, "statement_day", value)
-            reply_message(reply_token, f"✅ 信用卡結算日：每月 {value} 日。")
+            reply_message(reply_token, f"✅ 信用卡結算日已設定為每月 {value} 日。")
         elif setting_name == "錢包餘額":
             set_setting(line_user_id, "wallet_balance", value)
-            try:
-                add_initial_balance(line_user_id, sender, "wallet_balance", value)
-            except Exception as e:
-                sys.stdout.write(f"[INITIAL BALANCE] {e}\n")
-                reply_message(reply_token, "⚠️ 錢包餘額設定失敗，請稍後再試。")
-                return
+            record_initial_balance(line_user_id, sender, "錢包", value)
             reply_message(reply_token, f"✅ 錢包餘額 ${value:,}。")
         else:
             set_setting(line_user_id, "account_balance", value)
-            try:
-                add_initial_balance(line_user_id, sender, "account_balance", value)
-            except Exception as e:
-                sys.stdout.write(f"[INITIAL BALANCE] {e}\n")
-                reply_message(reply_token, "⚠️ 帳戶餘額設定失敗，請稍後再試。")
-                return
+            record_initial_balance(line_user_id, sender, "帳戶", value)
             reply_message(reply_token, f"✅ 帳戶餘額 ${value:,}。")
         return
 
@@ -780,22 +904,16 @@ def handle_event(event):
         "/統計": lambda: query_people_stats(line_user_id),
         "/stats": lambda: query_people_stats(line_user_id),
     }
-    if text == "帳本":
-        try:
-            sh_url = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/edit"
-            reply_message(reply_token, f"📒 你的工作表：{sender}\n{sh_url}")
-        except Exception:
-            reply_message(reply_token, "⚠️ 暫時無法取得帳本連結。")
-        return
     if text in commands:
         reply_message(reply_token, commands[text]())
         return
+
     if text in ["刪除", "刪除上一筆", "刪除上一筆記帳"]:
         try:
             reply_message(reply_token, delete_latest_record(line_user_id))
         except Exception as e:
             sys.stdout.write(f"[SHEETS] 刪除失敗：{e}\n")
-            reply_message(reply_token, "⚠️ 刪除失敗，請稍後再試。")
+            reply_message(reply_token, f"⚠️ 刪除失敗，請稍後再試。原因：{str(e)[:180]}")
         return
 
     payment_method = "bank"
@@ -806,15 +924,14 @@ def handle_event(event):
     elif re.match(r"^(金融卡|帳戶|銀行帳戶)(?:\s|[:：])", parse_text):
         payment_method = "bank"
         parse_text = re.sub(r"^(金融卡|帳戶|銀行帳戶)\s*[:：]?\s*", "", parse_text)
-
-    # Avoid responding to casual chat: only parse messages that look like a transaction.
-    has_amount = bool(re.search(r"\d[\d,]*\s*(元|塊|塊錢)?\s*$", parse_text))
-    looks_like_record = has_amount and (bool(re.search(r"^(刷卡|信用卡|卡刷|收入|入帳|進帳|支出|花費|付款|現金|金融卡|帳戶|銀行帳戶)\b", text)) or len(parse_text.split()) >= 2 or bool(re.search(r"(午餐|早餐|晚餐|薪水|薪資|寶雅|買|繳|交通|咖啡|便當|衣服|訂閱|醫療|車資)", parse_text)))
-    if not looks_like_record:
+    # 只有含有金額、且看起來像記帳的文字才進入解析；閒聊靜默忽略。
+    if not re.search(r"\d[\d,]*\s*(?:元|塊|塊錢)?\s*$", parse_text):
         return
     record = parse_record(parse_text)
     if not record:
-        reply_message(reply_token, "⚠️ 這筆記帳格式我看不懂，請試試：午餐 100 或 刷卡 寶雅 495。")
+        # 文字帶有金額但解析失敗，才提示格式；普通聊天不回覆。
+        if re.search(r"\d", parse_text):
+            reply_message(reply_token, "⚠️ 這筆記帳格式我看不懂，請試試：午餐 100 或 刷卡 寶雅 495。")
         return
     try:
         save_record(line_user_id, sender, record, payment_method)
@@ -828,14 +945,67 @@ def handle_event(event):
         sys.stdout.write(f"[SHEETS] 寫入成功：{record}\n")
     except Exception as e:
         sys.stdout.write(f"[SHEETS] 寫入失敗：{e}\n")
-        reply_message(reply_token, "⚠️ 這筆記帳沒有成功寫入，請稍後再試。")
+        reply_message(reply_token, f"⚠️ 這筆記帳沒有成功寫入，請稍後再試。\n原因：{str(e)[:200]}")
 
 
 init_db()
 
 @app.route("/auth/start", methods=["GET"])
 def auth_start():
-    return "Google 個別授權流程已停用；請由管理員設定共用試算表。", 410
+    link_token = request.args.get("link_token", "")
+    line_user_id = consume_link_token(link_token)
+    if not line_user_id:
+        return "連結已過期或已使用。請回到 LINE 群組，重新點選「連結 Google 帳號」。", 400
+    try:
+        flow = Flow.from_client_config(oauth_client_config(), scopes=GOOGLE_SCOPES, redirect_uri=OAUTH_REDIRECT_URI)
+        auth_url, state = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent")
+        save_oauth_session(state, line_user_id)
+        return __import__("flask").redirect(auth_url)
+    except Exception as e:
+        sys.stdout.write(f"[OAUTH] 建立授權網址失敗：{e}\n")
+        return "Google 授權設定尚未完成，請確認 Render 環境變數及 Google Cloud 設定。", 500
+
+
+@app.route("/auth/callback", methods=["GET"])
+def auth_callback():
+    error = request.args.get("error")
+    state = request.args.get("state", "")
+    line_user_id = consume_oauth_session(state)
+    if error:
+        return "你取消了 Google 授權。請回到 LINE 重新點選「連結 Google 帳號」。", 400
+    if not line_user_id:
+        return "授權連結已過期，請回到 LINE 重新點選「連結 Google 帳號」。", 400
+    code = request.args.get("code", "")
+    if not code:
+        return "Google 沒有回傳授權碼，請重新操作。", 400
+    try:
+        flow = Flow.from_client_config(oauth_client_config(), scopes=GOOGLE_SCOPES, state=state, redirect_uri=OAUTH_REDIRECT_URI)
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+        spreadsheet_url = create_user_spreadsheet(creds, line_user_id)
+        # 通知使用者授權成功；不把試算表連結貼到群組。
+        push_message(line_user_id, "✅ Google 帳號連結成功！\n已在你的 Google Drive 建立專屬「記帳小工具｜我的記帳」試算表。\n現在可以回到 LINE 群組開始記帳了。")
+        return ("<html><meta charset='utf-8'><body style='font-family:sans-serif;padding:24px'>"
+                "<h2>✅ Google 帳號連結成功！</h2>"
+                "<p>已建立你的專屬記帳試算表。你可以關閉此頁，回到 LINE 開始記帳。</p>"
+                f"<p><a href='{spreadsheet_url}' target='_blank' rel='noopener'>開啟我的 Google 試算表</a></p>"
+                "</body></html>")
+    except Exception as e:
+        sys.stdout.write(f"[OAUTH] 授權完成但建立試算表失敗：{e}\n")
+        return "Google 授權完成，但建立試算表失敗。請稍後回到 LINE 重新連結，並確認已啟用 Google Drive API 與 Google Sheets API。", 500
+
+
+def push_message(line_user_id, text):
+    if not LINE_CHANNEL_ACCESS_TOKEN or not line_user_id:
+        return
+    try:
+        response = req.post("https://api.line.me/v2/bot/message/push",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+            json={"to": line_user_id, "messages": [{"type": "text", "text": text[:4900]}]}, timeout=15)
+        if response.status_code >= 400:
+            sys.stdout.write(f"[LINE PUSH] 失敗 {response.status_code}: {response.text}\n")
+    except Exception as e:
+        sys.stdout.write(f"[LINE PUSH] 錯誤：{e}\n")
 
 
 @app.route("/callback", methods=["POST"])
