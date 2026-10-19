@@ -168,8 +168,8 @@ def shared_google_client():
         info = json.loads(GOOGLE_CREDENTIALS_JSON)
     except json.JSONDecodeError as e:
         raise RuntimeError("GOOGLE_CREDENTIALS_JSON 不是有效的 JSON，請貼上完整服務帳戶 JSON") from e
-    creds = gspread.service_account_from_dict(info)
-    return gspread.authorize(creds)
+    # service_account_from_dict 已直接回傳 gspread.Client；不可再傳入 authorize。
+    return gspread.service_account_from_dict(info)
 
 
 def safe_worksheet_title(display_name, user_id):
@@ -186,30 +186,48 @@ def get_sheet(line_user_id):
         raise RuntimeError("無法辨識 LINE 使用者 ID")
     gc = shared_google_client()
     sh = gc.open_by_key(GOOGLE_SHEET_ID)
+
+    # 不能盲目沿用舊版資料庫的 worksheet_title；舊版可能讓不同使用者
+    # 指到同一個「記帳」分頁。每個 LINE userId 都重新計算唯一分頁名稱。
     with db_connect() as conn:
-        profile = conn.execute("SELECT display_name,worksheet_title FROM user_profiles WHERE line_user_id=?", (line_user_id,)).fetchone()
-    if profile:
-        title = profile["worksheet_title"]
+        profile = conn.execute(
+            "SELECT display_name,worksheet_title FROM user_profiles WHERE line_user_id=?",
+            (line_user_id,)
+        ).fetchone()
+
+    cached_name = _SENDER_NAME_CACHE.get(line_user_id)
+    if cached_name:
+        display_name = cached_name
+    elif profile and profile["display_name"] and profile["display_name"] != "LINE使用者":
+        display_name = profile["display_name"]
     else:
         display_name = get_sender_name(line_user_id, {})
-        title = safe_worksheet_title(display_name, line_user_id)
-        with db_connect() as conn:
-            # 若名稱重複，以 ID 後四碼作為工作表名稱的一部分。
-            conn.execute("INSERT INTO user_profiles(line_user_id,display_name,worksheet_title,created_at) VALUES(?,?,?,?) ON CONFLICT(line_user_id) DO NOTHING",
-                         (line_user_id, display_name, title, now_tw().isoformat()))
-            stored = conn.execute("SELECT worksheet_title FROM user_profiles WHERE line_user_id=?", (line_user_id,)).fetchone()
-            title = stored["worksheet_title"]
+    if not display_name:
+        display_name = "LINE使用者"
+
+    title = safe_worksheet_title(display_name, line_user_id)
+    with db_connect() as conn:
+        conn.execute(
+            """INSERT INTO user_profiles(line_user_id,display_name,worksheet_title,created_at)
+               VALUES(?,?,?,?)
+               ON CONFLICT(line_user_id) DO UPDATE SET
+                 display_name=EXCLUDED.display_name,
+                 worksheet_title=EXCLUDED.worksheet_title""",
+            (line_user_id, display_name, title, now_tw().isoformat())
+        )
+
     try:
         ws = sh.worksheet(title)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=title, rows="2000", cols=str(len(HEADERS)))
         ws.update("A1", [HEADERS])
+
     values = ws.get_all_values()
     if not values:
         ws.update("A1", [HEADERS])
     elif values[0] != HEADERS:
-        # 舊版工作表若有「記錄人」欄，安全地只改標題，不清除資料。
-        if values[0] and values[0][0:2] == ["日期", "時間"] and "傳送者" in values[0]:
+        # 舊版工作表若有「傳送者」欄，安全地只改標題，不清除資料。
+        if values[0][0:2] == ["日期", "時間"] and "傳送者" in values[0]:
             idx = values[0].index("傳送者")
             ws.update_cell(1, idx + 1, "記錄人")
         else:
@@ -839,6 +857,12 @@ def handle_event(event):
         return
     sender = get_sender_name(line_user_id, source)
     sys.stdout.write(f"[MSG] {text!r} from {sender}\n")
+
+    # 精確輸入「醒醒」才會觸發，避免聊天時誤觸；用來確認機器人已啟動並可開始記帳。
+    if text == "醒醒":
+        reply_message(reply_token, "請開始記帳。")
+        sys.stdout.write("[WAKE] 已回覆喚醒確認\n")
+        return
 
     # 兩位使用者都可以手動觸發提醒。
     if text == "提醒":
