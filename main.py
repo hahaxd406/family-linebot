@@ -11,14 +11,10 @@ import datetime
 import threading
 import psycopg
 from psycopg.rows import dict_row
-import secrets
-from urllib.parse import quote
 
 import requests as req
 import gspread
 from flask import Flask, request
-from google.oauth2.credentials import Credentials as UserCredentials
-from google_auth_oauthlib.flow import Flow
 from openai import OpenAI
 
 app = Flask(__name__)
@@ -29,32 +25,39 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")  # Google 服務帳戶 JSON（完整 JSON 文字）
-GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
-GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
-BASE_URL = os.environ.get("BASE_URL", "https://family-linebot-mv4v.onrender.com").rstrip("/")
-OAUTH_REDIRECT_URI = os.environ.get("OAUTH_REDIRECT_URI", f"{BASE_URL}/auth/callback")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-GOOGLE_SCOPES = [
-    "https://www.googleapis.com/auth/drive.file",
-    "https://www.googleapis.com/auth/spreadsheets",
-]
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 TW = datetime.timezone(datetime.timedelta(hours=8))
 
-# ===== 大項目與小項目 =====
-# 支出與刷卡使用相同的小項目；繳卡費屬於實際支出。
+# ============================================================
+# ★★★ 小分類編輯區：要新增／刪除「餐飲、交通、生活」等項目，改這裡！★★★
+# 不用改程式其他地方：在對應清單的引號中新增名稱，項目之間用逗號隔開；
+# 要刪除就把該名稱移除。請保留方括號 [ ]。
+#
+# 【一般支出】例如：現金／金融卡支付的餐飲、交通、生活等
 EXPENSE_CATEGORIES = [
     "餐飲", "交通", "生活", "醫療健康", "美容保養", "服飾",
     "訂閱服務", "娛樂休閒", "運動健身", "旅遊", "教育", "保險",
     "稅費", "捐款公益", "其他", "繳卡費", "繳貸款"
 ]
-CARD_CATEGORIES = EXPENSE_CATEGORIES.copy()
+
+# 【刷卡】信用卡消費的小分類；這份清單獨立修改，不會連動一般支出
+CARD_CATEGORIES = [
+    "餐飲", "交通", "生活", "醫療健康", "美容保養", "服飾",
+    "訂閱服務", "娛樂休閒", "運動健身", "旅遊", "教育", "保險",
+    "稅費", "捐款公益", "其他", "繳卡費", "繳貸款"
+]
+
+# 【收入】例如：薪資、獎金、退款等收入的小分類
 INCOME_CATEGORIES = [
     "薪資", "獎金", "投資收入", "利息", "退款", "紅包",
     "補助", "兼職收入", "其他"
 ]
+
+# 大分類名稱（一般使用者通常不需要修改這行）
 MAIN_TYPES = ["支出", "收入", "刷卡"]
+# ======================== 小分類編輯區結束 ========================
 
 HEADERS = ["日期", "時間", "記錄人", "收支", "項目", "內容", "金額", "備註"]
 
@@ -94,23 +97,6 @@ def db_connect():
 
 def init_db():
     with db_connect() as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS users (
-            line_user_id TEXT PRIMARY KEY,
-            credentials_json TEXT NOT NULL,
-            spreadsheet_id TEXT NOT NULL,
-            linked_at TEXT NOT NULL
-        )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS oauth_sessions (
-            state TEXT PRIMARY KEY,
-            line_user_id TEXT NOT NULL,
-            created_at INTEGER NOT NULL
-        )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS link_tokens (
-            token TEXT PRIMARY KEY,
-            line_user_id TEXT NOT NULL,
-            expires_at INTEGER NOT NULL,
-            used INTEGER NOT NULL DEFAULT 0
-        )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS user_settings (
             line_user_id TEXT PRIMARY KEY,
             wallet_balance INTEGER NOT NULL DEFAULT 0,
@@ -137,21 +123,6 @@ def init_db():
                 pass
 
 
-def oauth_client_config():
-    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-        raise RuntimeError("Render 尚未設定 GOOGLE_CLIENT_ID 或 GOOGLE_CLIENT_SECRET")
-    return {"web": {
-        "client_id": GOOGLE_CLIENT_ID,
-        "client_secret": GOOGLE_CLIENT_SECRET,
-        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-        "token_uri": "https://oauth2.googleapis.com/token",
-        "redirect_uris": [OAUTH_REDIRECT_URI],
-    }}
-
-
-def get_user_row(line_user_id):
-    with db_connect() as conn:
-        return conn.execute("SELECT * FROM users WHERE line_user_id=?", (line_user_id,)).fetchone()
 
 
 def user_is_linked(line_user_id):
@@ -233,59 +204,6 @@ def get_sheet(line_user_id):
         else:
             raise RuntimeError(f"工作表「{title}」欄位與程式不一致，請先備份後再處理。")
     return ws
-
-def create_link_token(line_user_id):
-    token = secrets.token_urlsafe(32)
-    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
-    with db_connect() as conn:
-        conn.execute("INSERT INTO link_tokens(token,line_user_id,expires_at,used) VALUES(?,?,?,0)",
-                     (token, line_user_id, now + 600))
-    return token
-
-
-def consume_link_token(token):
-    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
-    with db_connect() as conn:
-        row = conn.execute("SELECT line_user_id,expires_at,used FROM link_tokens WHERE token=?", (token,)).fetchone()
-        if not row or row["used"] or row["expires_at"] < now:
-            return None
-        conn.execute("UPDATE link_tokens SET used=1 WHERE token=?", (token,))
-        return row["line_user_id"]
-
-
-def save_oauth_session(state, line_user_id):
-    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
-    with db_connect() as conn:
-        conn.execute("""INSERT INTO oauth_sessions(state,line_user_id,created_at) VALUES(?,?,?)
-                     ON CONFLICT(state) DO UPDATE SET line_user_id=EXCLUDED.line_user_id,
-                     created_at=EXCLUDED.created_at""", (state, line_user_id, now))
-
-
-def consume_oauth_session(state):
-    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
-    with db_connect() as conn:
-        row = conn.execute("SELECT line_user_id,created_at FROM oauth_sessions WHERE state=?", (state,)).fetchone()
-        conn.execute("DELETE FROM oauth_sessions WHERE state=?", (state,))
-        if not row or now - int(row["created_at"]) > 600:
-            return None
-        return row["line_user_id"]
-
-
-def create_user_spreadsheet(creds, line_user_id):
-    gc = gspread.authorize(creds)
-    sh = gc.create("記帳小工具｜我的記帳")
-    ws = sh.sheet1
-    ws.update_title("記帳")
-    ws.update("A1", [HEADERS])
-    # 將 token 與這位 LINE 使用者的試算表 ID 存在 Render 資料庫。
-    with db_connect() as conn:
-        conn.execute("""INSERT INTO users(line_user_id,credentials_json,spreadsheet_id,linked_at)
-            VALUES(?,?,?,?) ON CONFLICT(line_user_id) DO UPDATE SET
-            credentials_json=EXCLUDED.credentials_json,
-            spreadsheet_id=EXCLUDED.spreadsheet_id,
-            linked_at=EXCLUDED.linked_at""",
-            (line_user_id, creds.to_json(), sh.id, now_tw().isoformat()))
-    return sh.url
 
 
 def parse_date_hint(text):
@@ -435,7 +353,7 @@ def parse_record(text):
     if not client:
         return fallback_parse(text)
 
-    categories = INCOME_CATEGORIES if main_type == "收入" else EXPENSE_CATEGORIES
+    categories = INCOME_CATEGORIES if main_type == "收入" else (CARD_CATEGORIES if main_type == "刷卡" else EXPENSE_CATEGORIES)
     prompt = f"""
 你是繁體中文記帳助手。請把使用者訊息解析成一筆記帳資料。
 使用者原始訊息：{text}
@@ -471,7 +389,7 @@ def parse_record(text):
         item = str(data.get("item", "")).strip()
         amount = int(data.get("amount", 0))
         category = str(data.get("category", "其他")).strip()
-        allowed = INCOME_CATEGORIES if main_type == "收入" else EXPENSE_CATEGORIES
+        allowed = INCOME_CATEGORIES if main_type == "收入" else (CARD_CATEGORIES if main_type == "刷卡" else EXPENSE_CATEGORIES)
         if not item or amount <= 0 or category not in allowed:
             return fallback_parse(text)
         return {
@@ -736,17 +654,6 @@ def reply_message(reply_token, text):
     reply_messages(reply_token, [{"type": "text", "text": str(text)[:4900]}])
 
 
-def link_google_flex_message(link_url):
-    return {"type": "flex", "altText": "連結你的 Google 帳號", "contents": {
-        "type": "bubble", "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
-            {"type": "text", "text": "連結 Google 帳號", "weight": "bold", "size": "lg"},
-            {"type": "text", "text": "點擊下方按鈕，授權自己的 Google 帳號，建立只屬於你的記帳試算表。", "wrap": True, "size": "sm"}
-        ]},
-        "footer": {"type": "box", "layout": "vertical", "contents": [
-            flex_button("連結 Google 帳號", {"type": "uri", "label": "連結 Google 帳號", "uri": link_url})
-        ]}
-    }}
-
 
 WELCOME_MESSAGE = """🎉 歡迎使用「記帳小工具」！💚
 
@@ -773,6 +680,10 @@ WELCOME_MESSAGE = """🎉 歡迎使用「記帳小工具」！💚
 
 📅 忘記當天記帳也沒關係！支援昨天、前天及指定日期，輕鬆補記帳目。
 
+⚡ 喚醒機器人
+
+• 醒醒：確認機器人有回應；收到「請開始記帳。」後再輸入記帳內容
+
 📊 小工具指令說明
 
 • 今日：查看今天的收支與刷卡明細
@@ -783,9 +694,7 @@ WELCOME_MESSAGE = """🎉 歡迎使用「記帳小工具」！💚
 
 💚 直接在群組開始記帳即可！✨"""
 
-HELP_MESSAGE = """📖 記帳小工具｜使用說明 💚
-
-📝 一、如何記帳
+HELP_MESSAGE = """📝 一、如何記帳
 
 直接輸入項目和金額即可：
 
@@ -804,15 +713,16 @@ HELP_MESSAGE = """📖 記帳小工具｜使用說明 💚
 • 前天 買衣服 890：記錄前天的消費
 • 2026/10/15 晚餐 150：記錄指定日期的晚餐
 
-📊 三、小工具指令
-
+⚡ 三、小工具指令
+• 醒醒：確認機器人有回應；機器人回覆「請開始記帳。」後，再輸入記帳內容。
+  如果沒有收到回覆，先不要重複輸入同一筆消費，以免之後重複記帳。
 • 今日：查看今天的收支與刷卡明細
 • 本月：查看本月的收支與刷卡明細
 • 統計：查看累積收入、累積支出、目前餘額及本期已刷金額
 • 說明：查看完整使用方式
 • 刪除：刪除自己最近一筆記帳
 
-💚 記帳就是這麼簡單！祝你每天都能輕鬆掌握自己的財務狀況！✨"""
+💚 記帳就是這麼簡單！✨"""
 
 
 def welcome_flex():
@@ -833,17 +743,6 @@ def handle_event(event):
     if event_type == "join":
         reply_messages(reply_token, [welcome_flex()])
         sys.stdout.write("[WELCOME] 已送出加入聊天室歡迎詞\n")
-        return
-
-    if event_type == "postback":
-        data = (event.get("postback") or {}).get("data", "")
-        if data == "action=google_link":
-            if not line_user_id:
-                reply_message(reply_token, "⚠️ 無法辨識你的 LINE 帳號，請在群組內重新點選。")
-                return
-            token = create_link_token(line_user_id)
-            link_url = f"{BASE_URL}/auth/start?link_token={quote(token)}"
-            reply_messages(reply_token, [link_google_flex_message(link_url)])
         return
 
     if event_type != "message":
@@ -880,10 +779,6 @@ def handle_event(event):
                 reply_message(reply_token, f"⚠️ 暫時無法取得帳本連結：{str(e)[:150]}")
         return
 
-    # 舊版 OAuth 指令不再需要；不回覆連結授權流程。
-    if text in ["連結 Google 帳號", "連結Google", "Google連結", "重新連結 Google 帳號"]:
-        reply_message(reply_token, "💚 這個版本使用共用試算表，不需要個別連結 Google 帳號。")
-        return
 
     if text in ["說明", "/說明", "help", "/help"]:
         reply_message(reply_token, HELP_MESSAGE)
@@ -973,50 +868,6 @@ def handle_event(event):
 
 
 init_db()
-
-@app.route("/auth/start", methods=["GET"])
-def auth_start():
-    link_token = request.args.get("link_token", "")
-    line_user_id = consume_link_token(link_token)
-    if not line_user_id:
-        return "連結已過期或已使用。請回到 LINE 群組，重新點選「連結 Google 帳號」。", 400
-    try:
-        flow = Flow.from_client_config(oauth_client_config(), scopes=GOOGLE_SCOPES, redirect_uri=OAUTH_REDIRECT_URI)
-        auth_url, state = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent")
-        save_oauth_session(state, line_user_id)
-        return __import__("flask").redirect(auth_url)
-    except Exception as e:
-        sys.stdout.write(f"[OAUTH] 建立授權網址失敗：{e}\n")
-        return "Google 授權設定尚未完成，請確認 Render 環境變數及 Google Cloud 設定。", 500
-
-
-@app.route("/auth/callback", methods=["GET"])
-def auth_callback():
-    error = request.args.get("error")
-    state = request.args.get("state", "")
-    line_user_id = consume_oauth_session(state)
-    if error:
-        return "你取消了 Google 授權。請回到 LINE 重新點選「連結 Google 帳號」。", 400
-    if not line_user_id:
-        return "授權連結已過期，請回到 LINE 重新點選「連結 Google 帳號」。", 400
-    code = request.args.get("code", "")
-    if not code:
-        return "Google 沒有回傳授權碼，請重新操作。", 400
-    try:
-        flow = Flow.from_client_config(oauth_client_config(), scopes=GOOGLE_SCOPES, state=state, redirect_uri=OAUTH_REDIRECT_URI)
-        flow.fetch_token(code=code)
-        creds = flow.credentials
-        spreadsheet_url = create_user_spreadsheet(creds, line_user_id)
-        # 通知使用者授權成功；不把試算表連結貼到群組。
-        push_message(line_user_id, "✅ Google 帳號連結成功！\n已在你的 Google Drive 建立專屬「記帳小工具｜我的記帳」試算表。\n現在可以回到 LINE 群組開始記帳了。")
-        return ("<html><meta charset='utf-8'><body style='font-family:sans-serif;padding:24px'>"
-                "<h2>✅ Google 帳號連結成功！</h2>"
-                "<p>已建立你的專屬記帳試算表。你可以關閉此頁，回到 LINE 開始記帳。</p>"
-                f"<p><a href='{spreadsheet_url}' target='_blank' rel='noopener'>開啟我的 Google 試算表</a></p>"
-                "</body></html>")
-    except Exception as e:
-        sys.stdout.write(f"[OAUTH] 授權完成但建立試算表失敗：{e}\n")
-        return "Google 授權完成，但建立試算表失敗。請稍後回到 LINE 重新連結，並確認已啟用 Google Drive API 與 Google Sheets API。", 500
 
 
 def push_message(line_user_id, text):
