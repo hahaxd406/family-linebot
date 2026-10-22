@@ -26,13 +26,17 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")  # 舊設定保留；個人分帳以 USER_SPREADSHEET_MAP 為準
 USER_SPREADSHEET_MAP_JSON = os.environ.get("USER_SPREADSHEET_MAP", "{}")
 
-# ===== 個人試算表設定（先設定自己的，測試成功後再加入朋友） =====
+# ===== 個人試算表設定：每位 LINE 使用者各自使用自己的試算表 =====
 # 每位 LINE userId 對應自己的試算表 ID 與既有記帳工作表名稱。
 # 股票工作表會自動建立在同一份試算表中，名稱為「股票_」+ 記帳工作表名稱。
 PERSONAL_SHEETS = {
     "U0a81f4b57639d3d599aced33392c506d": {
         "spreadsheet_id": "1-uumCTYnKuPsftwg6Lbriht5Y6vARJDIPnPuDcAmVes",
         "worksheet_title": "Bu_506d",
+    },
+    "U1b8bc5162bdf85af9b8bed34cd38abc4": {
+        "spreadsheet_id": "1MeJRJ8RpixqJmpvO-0KeJAcmQfOJL62C_WmCIe2-Z7Q",
+        "worksheet_title": "Syuan_abc4",
     },
 }
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")  # Google 服務帳戶 JSON（完整 JSON 文字）
