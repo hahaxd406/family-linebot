@@ -23,7 +23,8 @@ app = Flask(__name__)
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")  # 舊設定保留；個人分帳以 USER_SPREADSHEET_MAP 為準
+USER_SPREADSHEET_MAP_JSON = os.environ.get("USER_SPREADSHEET_MAP", "{}")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")  # Google 服務帳戶 JSON（完整 JSON 文字）
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
@@ -126,14 +127,25 @@ def init_db():
 
 
 
+def get_user_spreadsheet_id(line_user_id):
+    """依 LINE userId 對應個人 Google 試算表；不使用群組 ID。"""
+    if not line_user_id:
+        return ""
+    try:
+        mapping = json.loads(USER_SPREADSHEET_MAP_JSON or "{}")
+    except json.JSONDecodeError as e:
+        raise RuntimeError("Render 的 USER_SPREADSHEET_MAP 不是有效 JSON") from e
+    if not isinstance(mapping, dict):
+        raise RuntimeError("USER_SPREADSHEET_MAP 必須是 LINE userId 對應試算表 ID 的 JSON 物件")
+    return str(mapping.get(line_user_id, "")).strip()
+
+
 def user_is_linked(line_user_id):
-    # 共用試算表模式：所有 LINE 使用者共用管理員設定的同一份試算表。
-    return bool(GOOGLE_SHEET_ID and GOOGLE_CREDENTIALS_JSON and DATABASE_URL)
+    # 每位 LINE 使用者必須有自己的試算表對應，避免誤寫入別人的帳本。
+    return bool(get_user_spreadsheet_id(line_user_id) and GOOGLE_CREDENTIALS_JSON and DATABASE_URL)
 
 
 def shared_google_client():
-    if not GOOGLE_SHEET_ID:
-        raise RuntimeError("Render 尚未設定 GOOGLE_SHEET_ID（共用試算表 ID）")
     if not GOOGLE_CREDENTIALS_JSON:
         raise RuntimeError("Render 尚未設定 GOOGLE_CREDENTIALS_JSON（Google 服務帳戶 JSON）")
     try:
@@ -156,8 +168,11 @@ def get_sheet(line_user_id):
     """開啟共用試算表中該 LINE 使用者專屬的工作表。"""
     if not line_user_id:
         raise RuntimeError("無法辨識 LINE 使用者 ID")
+    spreadsheet_id = get_user_spreadsheet_id(line_user_id)
+    if not spreadsheet_id:
+        raise RuntimeError("尚未設定你的個人試算表。請管理員在 Render 的 USER_SPREADSHEET_MAP 加入你的 LINE userId 與試算表 ID。")
     gc = shared_google_client()
-    sh = gc.open_by_key(GOOGLE_SHEET_ID)
+    sh = gc.open_by_key(spreadsheet_id)
 
     # 不能盲目沿用舊版資料庫的 worksheet_title；舊版可能讓不同使用者
     # 指到同一個「記帳」分頁。每個 LINE userId 都重新計算唯一分頁名稱。
@@ -725,7 +740,10 @@ def get_stock_sheet(line_user_id):
     """使用現有 LINE 使用者身分，建立／取得該使用者專屬股票分頁。"""
     accounting_ws = get_sheet(line_user_id)
     title = f"股票_{accounting_ws.title}"[:100]
-    spreadsheet = shared_google_client().open_by_key(GOOGLE_SHEET_ID)
+    spreadsheet_id = get_user_spreadsheet_id(line_user_id)
+    if not spreadsheet_id:
+        raise RuntimeError("尚未設定你的個人試算表，請管理員檢查 USER_SPREADSHEET_MAP。")
+    spreadsheet = shared_google_client().open_by_key(spreadsheet_id)
     try:
         ws = spreadsheet.worksheet(title)
     except gspread.WorksheetNotFound:
@@ -807,6 +825,14 @@ def handle_event(event):
     sender = get_sender_name(line_user_id, source)
     sys.stdout.write(f"[MSG] {text!r} from {sender}\n")
 
+    # 查詢自己的 LINE userId，方便管理員建立個人試算表對應。
+    if text in {"我的ID", "我的ID是什麼", "/myid"}:
+        if source.get("type") == "user":
+            reply_message(reply_token, f"你的 LINE userId：\n{line_user_id}\n請私訊管理員提供這串 ID。")
+        else:
+            reply_message(reply_token, "為了避免在群組公開帳號識別碼，請私訊機器人輸入「我的ID」。")
+        return
+
     # 精確輸入「醒醒」才會觸發，避免聊天時誤觸；用來確認機器人已啟動並可開始記帳。
     if text == "醒醒":
         reply_message(reply_token, "請開始記帳。")
@@ -819,14 +845,15 @@ def handle_event(event):
         return
 
     if text == "帳本":
-        if not GOOGLE_SHEET_ID:
-            reply_message(reply_token, "⚠️ 共用試算表尚未設定，請檢查管理員的 GOOGLE_SHEET_ID。")
-        else:
-            try:
+        try:
+            spreadsheet_id = get_user_spreadsheet_id(line_user_id)
+            if not spreadsheet_id:
+                reply_message(reply_token, "⚠️ 尚未設定你的個人試算表，請私訊管理員確認帳本綁定。")
+            else:
                 ws = get_sheet(line_user_id)
-                reply_message(reply_token, f"📒 這是你的工作表：{ws.title}\nhttps://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/edit#gid={ws.id}")
-            except Exception as e:
-                reply_message(reply_token, f"⚠️ 暫時無法取得帳本連結：{str(e)[:150]}")
+                reply_message(reply_token, f"📒 這是你的帳本：\nhttps://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit#gid={ws.id}")
+        except Exception as e:
+            reply_message(reply_token, f"⚠️ 暫時無法取得帳本連結：{str(e)[:150]}")
         return
 
 
@@ -834,7 +861,7 @@ def handle_event(event):
         reply_message(reply_token, HELP_MESSAGE)
         return
 
-    # 所有功能共用管理員指定的試算表，但每個 LINE 使用者只操作自己的工作表。
+    # 個人分帳模式：每個 LINE 使用者只能操作映射給自己的試算表。
     if not user_is_linked(line_user_id):
         # 一般閒聊不提示設定錯誤，避免群組洗版；但記帳格式必須明確告知原因，不能靜默忽略。
         setup_commands = {"今日", "今天", "/今日", "/today", "本週", "本周", "/本週", "本月", "/本月", "/month", "統計", "/統計", "/stats", "刪除", "刪除上一筆", "刪除上一筆記帳", "帳本"}
@@ -842,8 +869,8 @@ def handle_event(event):
         is_stock_like = bool(re.search(r"(?:^|\s)(?:買|賣)\s*[^\s]+\s+\d+(?:,\d{3})*\s*(?:股|張)\s+[\d,.]+\s*$", text))
         is_record_like = bool(re.search(r"\d[\d,]*(?:\.\d+)?\s*(?:元|塊|塊錢)?\s*$", text)) or is_stock_like
         if text in setup_commands or is_balance_setting or is_record_like:
-            sys.stdout.write("[CONFIG] 未記帳：GOOGLE_SHEET_ID、GOOGLE_CREDENTIALS_JSON 或 DATABASE_URL 未完整設定\n")
-            reply_message(reply_token, "⚠️ 記帳機器人尚未完成設定，這筆還沒有記錄。請確認 Render 的 GOOGLE_SHEET_ID、GOOGLE_CREDENTIALS_JSON、DATABASE_URL 都已設定，再重新記帳。")
+            sys.stdout.write("[CONFIG] 未記帳：個人試算表映射、GOOGLE_CREDENTIALS_JSON 或 DATABASE_URL 未完整設定\n")
+            reply_message(reply_token, "⚠️ 這個 LINE 帳號還沒有綁定個人試算表，這筆尚未記錄。請私訊管理員提供「我的ID」，完成 USER_SPREADSHEET_MAP 設定後再試。")
         return
 
     setting_match = re.fullmatch(r"(錢包餘額|帳戶餘額|信用卡結算日)\s*[:：]?\s*(\d+)", text)
