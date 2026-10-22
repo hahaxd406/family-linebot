@@ -60,6 +60,7 @@ MAIN_TYPES = ["支出", "收入", "刷卡"]
 # ======================== 小分類編輯區結束 ========================
 
 HEADERS = ["日期", "時間", "記錄人", "收支", "項目", "內容", "金額", "備註"]
+STOCK_HEADERS = ["日期", "股票代號／名稱", "買賣方向", "股數", "成交單價", "成交金額", "備註"]
 
 
 def now_tw():
@@ -512,6 +513,11 @@ def query_stats(line_user_id, period):
     if period == "today":
         filtered = [r for r in records if r["日期"] == today.isoformat()]
         title, empty_text = f"📅 {today.strftime('%Y/%m/%d')} 今日記帳總覽", "今天還沒有記帳資料。"
+    elif period == "week":
+        week_start = today - datetime.timedelta(days=today.weekday())
+        week_end = week_start + datetime.timedelta(days=6)
+        filtered = [r for r in records if len(r["日期"]) >= 10 and week_start.isoformat() <= r["日期"][:10] <= week_end.isoformat()]
+        title, empty_text = f"📊 本週記帳總覽（{week_start.strftime('%m/%d')}～{week_end.strftime('%m/%d')}）", "本週還沒有記帳資料。"
     else:
         ym = today.strftime("%Y-%m")
         filtered = [r for r in records if r["日期"].startswith(ym)]
@@ -694,35 +700,79 @@ WELCOME_MESSAGE = """🎉 歡迎使用「記帳小工具」！💚
 
 💚 直接在群組開始記帳即可！✨"""
 
-HELP_MESSAGE = """📝 一、如何記帳
+HELP_MESSAGE = """小工具可以做到的事🩵
 
-直接輸入項目和金額即可：
+・記支出：午餐 100、買衣服 890
+・記收入：收入 薪水 28000
+・記刷卡：刷卡 買衣服 890
+・記每月還款：繳貸款 5704、繳卡費 5000
+・忘記沒關係可以補上日期：昨天 午餐 100、10/20 晚餐 150
+・打錯了：刪除（刪掉自己最後一筆記帳）
+・查詢收支：今日／本週／本月
+・看個人帳務統計：統計
+・打開試算表：帳本
+・買進股票：買0050 100股 60.8
+・賣出股票：賣0050 100股 60.8
+・喚醒記帳小工具：醒醒（閒置後可能需要等待約 1～2 分鐘）
+・提醒對方記帳：提醒
+・看使用說明：說明
 
-• 午餐 100：記錄一般支出（預設從銀行帳戶扣除）
-• 刷卡 買衣服 890：記錄信用卡消費
-• 收入 薪水 28000：記錄收入
-• 繳貸款 5704：記錄貸款繳費
-• 繳卡費 5000：記錄信用卡繳費
+✨記帳小工具，讓記帳變簡單✨"""
 
-📅 二、日期設定與補記
 
-忘記當天記帳也沒關係，可以指定日期：
 
-• 午餐 100：記錄今天的午餐
-• 昨天 午餐 100：記錄昨天的午餐
-• 前天 買衣服 890：記錄前天的消費
-• 2026/10/15 晚餐 150：記錄指定日期的晚餐
+def get_stock_sheet(line_user_id):
+    """使用現有 LINE 使用者身分，建立／取得該使用者專屬股票分頁。"""
+    accounting_ws = get_sheet(line_user_id)
+    title = f"股票_{accounting_ws.title}"[:100]
+    spreadsheet = shared_google_client().open_by_key(GOOGLE_SHEET_ID)
+    try:
+        ws = spreadsheet.worksheet(title)
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=title, rows="2000", cols=str(len(STOCK_HEADERS)))
+        ws.update("A1", [STOCK_HEADERS])
+    values = ws.get_all_values()
+    if not values:
+        ws.update("A1", [STOCK_HEADERS])
+    elif values[0] != STOCK_HEADERS:
+        raise RuntimeError(f"股票工作表「{title}」欄位與程式不一致，請先確認欄位。")
+    return ws
 
-⚡ 三、小工具指令
-• 醒醒：確認機器人有回應；機器人回覆「請開始記帳。」後，再輸入記帳內容。
-  如果沒有收到回覆，先不要重複輸入同一筆消費，以免之後重複記帳。
-• 今日：查看今天的收支與刷卡明細
-• 本月：查看本月的收支與刷卡明細
-• 統計：查看累積收入、累積支出、目前餘額及本期已刷金額
-• 說明：查看完整使用方式
-• 刪除：刪除自己最近一筆記帳
 
-💚 記帳就是這麼簡單！✨"""
+def parse_stock_command(text):
+    """解析買／賣股票；股數可用股或張，1 張按 1000 股換算。"""
+    target_date, cleaned = parse_date_hint(text)
+    match = re.fullmatch(
+        r"\s*(買|賣)\s*([^\s]+)\s+(\d+(?:,\d{3})*|\d+)\s*(股|張)\s+([\d,]+(?:\.\d+)?)\s*",
+        cleaned,
+    )
+    if not match:
+        return None
+    action, symbol, quantity_text, unit, price_text = match.groups()
+    quantity = int(quantity_text.replace(",", ""))
+    if quantity <= 0:
+        return None
+    shares = quantity * (1000 if unit == "張" else 1)
+    price = float(price_text.replace(",", ""))
+    if price <= 0:
+        return None
+    amount = round(shares * price, 2)
+    return {
+        "date": target_date.isoformat(),
+        "symbol": symbol,
+        "direction": "買進" if action == "買" else "賣出",
+        "shares": shares,
+        "price": price,
+        "amount": amount,
+    }
+
+
+def save_stock_record(line_user_id, record):
+    ws = get_stock_sheet(line_user_id)
+    ws.append_row([
+        record["date"], record["symbol"], record["direction"], record["shares"],
+        record["price"], record["amount"], ""
+    ], value_input_option="USER_ENTERED")
 
 
 def welcome_flex():
@@ -741,8 +791,8 @@ def handle_event(event):
     line_user_id = source.get("userId", "")
 
     if event_type == "join":
-        reply_messages(reply_token, [welcome_flex()])
-        sys.stdout.write("[WELCOME] 已送出加入聊天室歡迎詞\n")
+        # 使用者已將小工具加入群組，不再自動傳送加入群組歡迎訊息。
+        sys.stdout.write("[JOIN] 已略過自動歡迎訊息\n")
         return
 
     if event_type != "message":
@@ -787,9 +837,10 @@ def handle_event(event):
     # 所有功能共用管理員指定的試算表，但每個 LINE 使用者只操作自己的工作表。
     if not user_is_linked(line_user_id):
         # 一般閒聊不提示設定錯誤，避免群組洗版；但記帳格式必須明確告知原因，不能靜默忽略。
-        setup_commands = {"今日", "今天", "/今日", "/today", "本月", "/本月", "/month", "統計", "/統計", "/stats", "刪除", "刪除上一筆", "刪除上一筆記帳", "帳本"}
+        setup_commands = {"今日", "今天", "/今日", "/today", "本週", "本周", "/本週", "本月", "/本月", "/month", "統計", "/統計", "/stats", "刪除", "刪除上一筆", "刪除上一筆記帳", "帳本"}
         is_balance_setting = re.match(r"^(錢包餘額|帳戶餘額|信用卡結算日)\s*[:：]?\s*\d+$", text)
-        is_record_like = bool(re.search(r"\d[\d,]*\s*(?:元|塊|塊錢)?\s*$", text))
+        is_stock_like = bool(re.search(r"(?:^|\s)(?:買|賣)\s*[^\s]+\s+\d+(?:,\d{3})*\s*(?:股|張)\s+[\d,.]+\s*$", text))
+        is_record_like = bool(re.search(r"\d[\d,]*(?:\.\d+)?\s*(?:元|塊|塊錢)?\s*$", text)) or is_stock_like
         if text in setup_commands or is_balance_setting or is_record_like:
             sys.stdout.write("[CONFIG] 未記帳：GOOGLE_SHEET_ID、GOOGLE_CREDENTIALS_JSON 或 DATABASE_URL 未完整設定\n")
             reply_message(reply_token, "⚠️ 記帳機器人尚未完成設定，這筆還沒有記錄。請確認 Render 的 GOOGLE_SHEET_ID、GOOGLE_CREDENTIALS_JSON、DATABASE_URL 都已設定，再重新記帳。")
@@ -815,11 +866,29 @@ def handle_event(event):
             reply_message(reply_token, f"✅ 帳戶餘額 ${value:,}。")
         return
 
+    stock_record = parse_stock_command(text)
+    if stock_record:
+        try:
+            save_stock_record(line_user_id, stock_record)
+            date_note = f"\n📅 記錄日期：{stock_record['date']}" if stock_record["date"] != now_tw().date().isoformat() else ""
+            amount_label = f"${stock_record['amount']:,.2f}".rstrip("0").rstrip(".")
+            price_label = f"${stock_record['price']:,.4f}".rstrip("0").rstrip(".")
+            reply_message(reply_token,
+                f"✅ 股票{stock_record['direction']}｜{stock_record['symbol']}｜{stock_record['shares']:,} 股\n"
+                f"成交單價：{price_label}\n成交金額：{amount_label}{date_note}\n📒 已記錄到你的股票工作表（未含手續費與交易稅）")
+        except Exception as e:
+            sys.stdout.write(f"[STOCK SHEETS] 寫入失敗：{e}\n")
+            reply_message(reply_token, f"⚠️ 股票交易沒有成功寫入，請稍後再試。原因：{str(e)[:180]}")
+        return
+
     commands = {
         "今日": lambda: query_stats(line_user_id, "today"),
         "今天": lambda: query_stats(line_user_id, "today"),
         "/今日": lambda: query_stats(line_user_id, "today"),
         "/today": lambda: query_stats(line_user_id, "today"),
+        "本週": lambda: query_stats(line_user_id, "week"),
+        "本周": lambda: query_stats(line_user_id, "week"),
+        "/本週": lambda: query_stats(line_user_id, "week"),
         "本月": lambda: query_stats(line_user_id, "month"),
         "/本月": lambda: query_stats(line_user_id, "month"),
         "/month": lambda: query_stats(line_user_id, "month"),
