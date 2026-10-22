@@ -25,6 +25,16 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")  # 舊設定保留；個人分帳以 USER_SPREADSHEET_MAP 為準
 USER_SPREADSHEET_MAP_JSON = os.environ.get("USER_SPREADSHEET_MAP", "{}")
+
+# ===== 個人試算表設定（先設定自己的，測試成功後再加入朋友） =====
+# 每位 LINE userId 對應自己的試算表 ID 與既有記帳工作表名稱。
+# 股票工作表會自動建立在同一份試算表中，名稱為「股票_」+ 記帳工作表名稱。
+PERSONAL_SHEETS = {
+    "U0a81f4b57639d3d599aced33392c506d": {
+        "spreadsheet_id": "1-uumCTYnKuPsftwg6Lbriht5Y6vARJDIPnPuDcAmVes",
+        "worksheet_title": "Bu_506d",
+    },
+}
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")  # Google 服務帳戶 JSON（完整 JSON 文字）
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
@@ -127,18 +137,33 @@ def init_db():
 
 
 
-def get_user_spreadsheet_id(line_user_id):
-    """依 LINE userId 對應個人 Google 試算表；不使用群組 ID。"""
+def get_personal_sheet_config(line_user_id):
+    """取得 LINE 使用者的個人試算表設定；環境變數設定可額外覆蓋／新增。"""
     if not line_user_id:
-        return ""
+        return {}
+    mapping = dict(PERSONAL_SHEETS)
     try:
-        mapping = json.loads(USER_SPREADSHEET_MAP_JSON or "{}")
+        env_mapping = json.loads(USER_SPREADSHEET_MAP_JSON or "{}")
     except json.JSONDecodeError as e:
         raise RuntimeError("Render 的 USER_SPREADSHEET_MAP 不是有效 JSON") from e
-    if not isinstance(mapping, dict):
-        raise RuntimeError("USER_SPREADSHEET_MAP 必須是 LINE userId 對應試算表 ID 的 JSON 物件")
-    return str(mapping.get(line_user_id, "")).strip()
+    if not isinstance(env_mapping, dict):
+        raise RuntimeError("USER_SPREADSHEET_MAP 必須是 LINE userId 對應設定的 JSON 物件")
+    mapping.update(env_mapping)
+    config = mapping.get(line_user_id, {})
+    # 相容舊格式：userId: "spreadsheet_id"；這種格式會沿用自動命名工作表。
+    if isinstance(config, str):
+        config = {"spreadsheet_id": config}
+    return config if isinstance(config, dict) else {}
 
+
+def get_user_spreadsheet_id(line_user_id):
+    config = get_personal_sheet_config(line_user_id)
+    return str(config.get("spreadsheet_id", "")).strip()
+
+
+def get_user_worksheet_title(line_user_id):
+    config = get_personal_sheet_config(line_user_id)
+    return str(config.get("worksheet_title", "")).strip()
 
 def user_is_linked(line_user_id):
     # 每位 LINE 使用者必須有自己的試算表對應，避免誤寫入別人的帳本。
@@ -165,7 +190,7 @@ def safe_worksheet_title(display_name, user_id):
 
 
 def get_sheet(line_user_id):
-    """開啟共用試算表中該 LINE 使用者專屬的工作表。"""
+    """開啟該 LINE 使用者設定的個人試算表與記帳工作表。"""
     if not line_user_id:
         raise RuntimeError("無法辨識 LINE 使用者 ID")
     spreadsheet_id = get_user_spreadsheet_id(line_user_id)
@@ -174,8 +199,7 @@ def get_sheet(line_user_id):
     gc = shared_google_client()
     sh = gc.open_by_key(spreadsheet_id)
 
-    # 不能盲目沿用舊版資料庫的 worksheet_title；舊版可能讓不同使用者
-    # 指到同一個「記帳」分頁。每個 LINE userId 都重新計算唯一分頁名稱。
+    # 若個人設定指定了既有工作表名稱，就直接使用它；否則沿用自動命名方式。
     with db_connect() as conn:
         profile = conn.execute(
             "SELECT display_name,worksheet_title FROM user_profiles WHERE line_user_id=?",
@@ -192,7 +216,8 @@ def get_sheet(line_user_id):
     if not display_name:
         display_name = "LINE使用者"
 
-    title = safe_worksheet_title(display_name, line_user_id)
+    configured_title = get_user_worksheet_title(line_user_id)
+    title = configured_title or safe_worksheet_title(display_name, line_user_id)
     with db_connect() as conn:
         conn.execute(
             """INSERT INTO user_profiles(line_user_id,display_name,worksheet_title,created_at)
