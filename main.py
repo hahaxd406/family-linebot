@@ -823,7 +823,7 @@ def handle_event(event):
         reply_message(reply_token, "⚠️ 無法辨識你的 LINE 帳號，請重新傳送訊息。")
         return
     sender = get_sender_name(line_user_id, source)
-    sys.stdout.write(f"[MSG] {text!r} from {sender}\n")
+    sys.stdout.write(f"[MSG] {text!r} from {sender} | LINE userId={line_user_id}\n")
 
     # 查詢自己的 LINE userId，方便管理員建立個人試算表對應。
     if text in {"我的ID", "我的ID是什麼", "/myid"}:
