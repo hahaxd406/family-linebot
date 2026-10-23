@@ -35,26 +35,29 @@ USER_SPREADSHEET_MAP_JSON = os.environ.get("USER_SPREADSHEET_MAP", "{}")
 PERSONAL_SHEETS = {
     "U0a81f4b57639d3d599aced33392c506d": {
         "spreadsheet_id": "1-uumCTYnKuPsftwg6Lbriht5Y6vARJDIPnPuDcAmVes",
-        "main_worksheet": "Bu_506d",
+        "main_worksheet": "帳本",
+        "legacy_main_worksheets": ["Bu_506d"],
         "worksheets": {
-            "stock": "股票_Bu_506d",
-            "foreign_currency": "外幣支出",
+            "stock": "股票",
+            "foreign_currency": "外幣",
         },
     },
     "U1b8bc5162bdf85af9b8bed34cd38abc4": {
         "spreadsheet_id": "1MeJRJ8RpixqJmpvO-0KeJAcmQfOJL62C_WmCIe2-Z7Q",
-        "main_worksheet": "Syuan_abc4",
+        "main_worksheet": "帳本",
+        "legacy_main_worksheets": ["Syuan_abc4"],
         "worksheets": {
-            "stock": "股票_Syuan_abc4",
-            "foreign_currency": "外幣支出",
+            "stock": "股票",
+            "foreign_currency": "外幣",
         },
     },
-    # 第三位朋友：主要工作表未指定時，程式會依 LINE 顯示名稱自動建立／取得。
     "U5ff9728b5d981070890d63b610a7b834": {
         "spreadsheet_id": "1JegFHHQfZ5nV3WlL0dRrVAwbVlP8-t9mFFLn2a0WR20",
+        "main_worksheet": "帳本",
+        "legacy_main_worksheets": [],
         "worksheets": {
-            "foreign_currency": "外幣支出",
-            # 股票工作表未指定時，會自動使用「股票_<主要工作表名稱>」。
+            "stock": "股票",
+            "foreign_currency": "外幣",
         },
     },
 }
@@ -225,6 +228,33 @@ def safe_worksheet_title(display_name, user_id):
     return f"{name}_{suffix}"[:100]
 
 
+def get_or_rename_worksheet(spreadsheet, title, legacy_titles, rows, cols, headers):
+    """Use the canonical tab name, renaming a legacy tab in place to preserve its data."""
+    try:
+        ws = spreadsheet.worksheet(title)
+    except gspread.WorksheetNotFound:
+        ws = None
+        for old_title in legacy_titles or []:
+            if not old_title or old_title == title:
+                continue
+            try:
+                ws = spreadsheet.worksheet(old_title)
+                ws.update_title(title)
+                sys.stdout.write(f"[SHEETS] 已將工作表「{old_title}」改名為「{title}」\n")
+                break
+            except gspread.WorksheetNotFound:
+                continue
+        if ws is None:
+            ws = spreadsheet.add_worksheet(title=title, rows=str(rows), cols=str(cols))
+            ws.update("A1", [headers])
+    values = ws.get_all_values()
+    if not values:
+        ws.update("A1", [headers])
+    elif values[0] != headers:
+        raise RuntimeError(f"工作表「{title}」欄位與程式不一致，為避免資料遺失未自動覆蓋。")
+    return ws
+
+
 def get_sheet(line_user_id):
     """開啟該 LINE 使用者設定的個人試算表與記帳工作表。"""
     if not line_user_id:
@@ -264,17 +294,34 @@ def get_sheet(line_user_id):
             (line_user_id, display_name, title, now_tw().isoformat())
         )
 
+    config = get_personal_sheet_config(line_user_id)
+    legacy_titles = list(config.get("legacy_main_worksheets", []))
+    if profile and profile["worksheet_title"] and profile["worksheet_title"] != title:
+        legacy_titles.append(profile["worksheet_title"])
+    # 相容第三位使用者的舊版自動命名分頁。
+    legacy_titles.extend([safe_worksheet_title(display_name, line_user_id)])
     try:
         ws = sh.worksheet(title)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=title, rows="2000", cols=str(len(HEADERS)))
-        ws.update("A1", [HEADERS])
+        ws = None
+        for old_title in dict.fromkeys(legacy_titles):
+            if not old_title or old_title == title:
+                continue
+            try:
+                ws = sh.worksheet(old_title)
+                ws.update_title(title)
+                sys.stdout.write(f"[SHEETS] 已將工作表「{old_title}」改名為「{title}」\n")
+                break
+            except gspread.WorksheetNotFound:
+                continue
+        if ws is None:
+            ws = sh.add_worksheet(title=title, rows="2000", cols=str(len(HEADERS)))
+            ws.update("A1", [HEADERS])
 
     values = ws.get_all_values()
     if not values:
         ws.update("A1", [HEADERS])
     elif values[0] != HEADERS:
-        # 舊版工作表若有「傳送者」欄，安全地只改標題，不清除資料。
         if values[0][0:2] == ["日期", "時間"] and "傳送者" in values[0]:
             idx = values[0].index("傳送者")
             ws.update_cell(1, idx + 1, "記錄人")
@@ -830,19 +877,33 @@ def parse_foreign_record(text, active_currency=None):
             "item": item, "amount": amount, "category": category}
 
 def get_foreign_sheet(line_user_id):
-    """在該使用者自己的試算表中建立／取得「外幣支出」工作表。"""
+    """在該使用者自己的試算表中建立／取得「外幣」工作表。"""
     if not line_user_id:
         raise RuntimeError("無法辨識 LINE 使用者 ID")
     spreadsheet_id = get_user_spreadsheet_id(line_user_id)
     if not spreadsheet_id:
         raise RuntimeError("尚未設定你的個人試算表。")
     sh = shared_google_client().open_by_key(spreadsheet_id)
-    title = get_user_feature_worksheet_title(line_user_id, "foreign_currency", "外幣支出")
+    title = get_user_feature_worksheet_title(line_user_id, "foreign_currency", "外幣")
+    config = get_personal_sheet_config(line_user_id)
+    legacy_titles = ["外幣支出", "外幣"]
     try:
         ws = sh.worksheet(title)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=title, rows="2000", cols=str(len(FOREIGN_HEADERS)))
-        ws.update("A1", [FOREIGN_HEADERS])
+        ws = None
+        for old_title in legacy_titles:
+            if old_title == title:
+                continue
+            try:
+                ws = sh.worksheet(old_title)
+                ws.update_title(title)
+                sys.stdout.write(f"[SHEETS] 已將工作表「{old_title}」改名為「{title}」\n")
+                break
+            except gspread.WorksheetNotFound:
+                continue
+        if ws is None:
+            ws = sh.add_worksheet(title=title, rows="2000", cols=str(len(FOREIGN_HEADERS)))
+            ws.update("A1", [FOREIGN_HEADERS])
     values = ws.get_all_values()
     if not values:
         ws.update("A1", [FOREIGN_HEADERS])
@@ -931,7 +992,24 @@ def query_stats(line_user_id, period):
 
 
 def delete_latest_record(line_user_id):
-    """每個使用者只有自己的試算表，因此只會刪除自己的最後一筆。"""
+    """刪除目前模式對應工作表中自己的最後一筆記錄。"""
+    mode = get_currency_mode(line_user_id)
+    if mode != "TWD":
+        ws = get_foreign_sheet(line_user_id)
+        values = ws.get_all_values()
+        if len(values) <= 1:
+            return "外幣工作表目前沒有可刪除的記錄。"
+        # 外幣欄位：日期、時間、記錄人、收支、項目、內容、幣別、金額、備註
+        for row_num in range(len(values), 1, -1):
+            row = values[row_num - 1]
+            recorder = row[2].strip() if len(row) > 2 else ""
+            if recorder == get_sender_name(line_user_id, {}) or not recorder:
+                item = row[5] if len(row) > 5 else "未命名項目"
+                amount = row[7] if len(row) > 7 else "0"
+                ws.delete_rows(row_num)
+                return f"🗑️ 已刪除外幣最後一筆：{item} {amount}（{mode}）"
+        return "外幣工作表找不到你自己的記錄，沒有刪除任何資料。"
+
     ws = get_sheet(line_user_id)
     rows = ws.get_all_records()
     if not rows:
@@ -945,6 +1023,23 @@ def delete_latest_record(line_user_id):
     with db_connect() as conn:
         conn.execute("DELETE FROM transaction_meta WHERE line_user_id=? AND sheet_row=?", (line_user_id, sheet_row_number))
     return f"🗑️ 已刪除上一筆：{main_type}｜{item} ${amount}"
+
+
+def delete_latest_stock_record(line_user_id):
+    """刪除股票工作表最後一筆交易；不碰一般收支或外幣帳本。"""
+    ws = get_stock_sheet(line_user_id)
+    values = ws.get_all_values()
+    if len(values) <= 1:
+        return "股票工作表目前沒有可刪除的交易。"
+    for row_num in range(len(values), 1, -1):
+        row = values[row_num - 1]
+        if any(str(cell).strip() for cell in row):
+            symbol = row[1] if len(row) > 1 else "未命名股票"
+            direction = row[2] if len(row) > 2 else "交易"
+            shares = row[3] if len(row) > 3 else ""
+            ws.delete_rows(row_num)
+            return f"🗑️ 已刪除股票最後一筆：{direction}｜{symbol}｜{shares} 股"
+    return "股票工作表目前沒有可刪除的交易。"
 
 
 def get_settings(line_user_id):
@@ -1043,25 +1138,7 @@ def reply_message(reply_token, text):
 
 
 
-WELCOME_MESSAGE = """小工具可以做到的事🩵
-
-・記支出：午餐 100、買衣服 890
-・記收入：收入 薪水 28000
-・記刷卡：刷卡 買衣服 890
-・記每月還款：繳貸款 5704、繳卡費 5000
-・切換外幣模式：先輸入「幣別名稱」後，開始像正常記帳一樣記錄；使用完輸入「新台幣」切回日常使用
-・忘記沒關係可以補上日期：昨天 午餐 100、10/20 晚餐 150
-・打錯了：刪除（刪掉自己最後一筆記帳）
-・查詢收支：今日／本週／本月
-・看個人帳務統計：統計
-・打開試算表：帳本
-・買進股票：買0050 100股 60.8
-・賣出股票：賣0050 100股 60.8
-・喚醒記帳小工具：醒醒（閒置後可能需要等待約 1～2 分鐘）
-・提醒對方記帳：提醒
-・看使用說明：說明
-
-✨記帳小工具，讓記帳變簡單✨"""
+WELCOME_MESSAGE = """歡迎使用記帳小工具，可以輸入說明看使用方式。"""
 
 HELP_MESSAGE = """小工具可以做到的事🩵
 
@@ -1071,7 +1148,7 @@ HELP_MESSAGE = """小工具可以做到的事🩵
 ・記每月還款：繳貸款 5704、繳卡費 5000
 ・切換外幣模式：先輸入「幣別名稱」後，開始像正常記帳一樣記錄；使用完輸入「新台幣」切回日常使用
 ・忘記沒關係可以補上日期：昨天 午餐 100、10/20 晚餐 150
-・打錯了：刪除（刪掉自己最後一筆記帳）
+・打錯了沒關係：「刪除」，可以刪台外幣最新一筆收支；「刪除股票」，可以刪除股票記錄
 ・查詢收支：今日／本週／本月
 ・看個人帳務統計：統計
 ・打開試算表：帳本
@@ -1087,25 +1164,25 @@ HELP_MESSAGE = """小工具可以做到的事🩵
 
 def get_stock_sheet(line_user_id):
     """使用現有 LINE 使用者身分，建立／取得該使用者專屬股票分頁。"""
-    accounting_ws = get_sheet(line_user_id)
-    title = get_user_feature_worksheet_title(
-        line_user_id, "stock", f"股票_{accounting_ws.title}"
-    )
+    get_sheet(line_user_id)  # 確認使用者帳本設定正確
+    title = get_user_feature_worksheet_title(line_user_id, "stock", "股票")
     spreadsheet_id = get_user_spreadsheet_id(line_user_id)
     if not spreadsheet_id:
         raise RuntimeError("尚未設定你的個人試算表，請管理員檢查 USER_SPREADSHEET_MAP。")
     spreadsheet = shared_google_client().open_by_key(spreadsheet_id)
+    legacy_stock_titles = ["股票_Bu_506d", "股票_Syuan_abc4"]
+    # 舊版第三位使用者的股票分頁可能以顯示名稱命名；若「股票」不存在且只有一張舊股票分頁，就原地改名保留資料。
     try:
-        ws = spreadsheet.worksheet(title)
+        spreadsheet.worksheet(title)
     except gspread.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=title, rows="2000", cols=str(len(STOCK_HEADERS)))
-        ws.update("A1", [STOCK_HEADERS])
-    values = ws.get_all_values()
-    if not values:
-        ws.update("A1", [STOCK_HEADERS])
-    elif values[0] != STOCK_HEADERS:
-        raise RuntimeError(f"股票工作表「{title}」欄位與程式不一致，請先確認欄位。")
-    return ws
+        legacy_stock_titles.extend(
+            tab.title for tab in spreadsheet.worksheets()
+            if tab.title.startswith("股票_") and tab.title not in legacy_stock_titles
+        )
+    return get_or_rename_worksheet(
+        spreadsheet, title, legacy_stock_titles,
+        2000, len(STOCK_HEADERS), STOCK_HEADERS
+    )
 
 
 def parse_stock_command(text):
@@ -1221,7 +1298,7 @@ def handle_event(event):
     # 個人分帳模式：每個 LINE 使用者只能操作映射給自己的試算表。
     if not user_is_linked(line_user_id):
         # 一般閒聊不提示設定錯誤，避免群組洗版；但記帳格式必須明確告知原因，不能靜默忽略。
-        setup_commands = {"今日", "今天", "/今日", "/today", "本週", "本周", "/本週", "本月", "/本月", "/month", "統計", "/統計", "/stats", "刪除", "刪除上一筆", "刪除上一筆記帳", "帳本"}
+        setup_commands = {"今日", "今天", "/今日", "/today", "本週", "本周", "/本週", "本月", "/本月", "/month", "統計", "/統計", "/stats", "刪除", "刪除上一筆", "刪除上一筆記帳", "刪除股票", "刪除股票上一筆", "刪除上一筆股票", "帳本"}
         is_balance_setting = re.match(r"^(錢包餘額|帳戶餘額|信用卡結算日)\s*[:：]?\s*\d+$", text)
         is_stock_like = bool(re.search(r"(?:^|\s)(?:買|賣)\s*[^\s]+\s+\d+(?:,\d{3})*\s*(?:股|張)\s+[\d,.]+\s*$", text))
         is_record_like = bool(re.search(r"\d[\d,]*(?:\.\d+)?\s*(?:元|塊|塊錢)?\s*$", text)) or is_stock_like
@@ -1238,7 +1315,7 @@ def handle_event(event):
             if requested_currency == "TWD":
                 reply_message(reply_token, "✅ 已切回新台幣日常記帳模式。\n接下來的支出會寫入原本的記帳工作表。")
             else:
-                reply_message(reply_token, f"✅ 已切換至 {requested_currency} 外幣記帳模式！\n現在可以開始記錄外幣支出或收入，例如：早餐 100、收入 退款 50。\n接下來會寫入「外幣支出」工作表，保留你選擇的幣別與原幣金額，不換算新台幣，也不併入台幣統計。\n要切回日常記帳，請單獨輸入「新台幣」。")
+                reply_message(reply_token, f"✅ 已切換至 {requested_currency} 外幣記帳模式！\n現在可以開始記錄外幣支出或收入，例如：早餐 100、收入 退款 50。\n接下來會寫入「外幣」工作表，保留你選擇的幣別與原幣金額，不換算新台幣，也不併入台幣統計。\n要切回日常記帳，請單獨輸入「新台幣」。")
         except Exception as e:
             sys.stdout.write(f"[CURRENCY MODE] 切換失敗：{e}\n")
             reply_message(reply_token, f"⚠️ 幣別模式切換失敗，這次沒有切換成功，因此請先不要輸入消費。原因：{str(e)[:180]}")
@@ -1298,6 +1375,14 @@ def handle_event(event):
         reply_message(reply_token, commands[text]())
         return
 
+    if text in ["刪除股票", "刪除股票上一筆", "刪除上一筆股票"]:
+        try:
+            reply_message(reply_token, delete_latest_stock_record(line_user_id))
+        except Exception as e:
+            sys.stdout.write(f"[STOCK SHEETS] 刪除失敗：{e}\n")
+            reply_message(reply_token, f"⚠️ 股票刪除失敗，沒有刪除其他帳本資料。原因：{str(e)[:180]}")
+        return
+
     if text in ["刪除", "刪除上一筆", "刪除上一筆記帳"]:
         try:
             reply_message(reply_token, delete_latest_record(line_user_id))
@@ -1306,7 +1391,7 @@ def handle_event(event):
             reply_message(reply_token, f"⚠️ 刪除失敗，請稍後再試。原因：{str(e)[:180]}")
         return
 
-    # 明確提到非新台幣幣別時，獨立寫入「外幣支出」，不納入新台幣帳本統計。
+    # 明確提到非新台幣幣別時，獨立寫入「外幣」，不納入新台幣帳本統計。
     current_currency_mode = get_currency_mode(line_user_id)
     foreign_record = parse_foreign_record(text, active_currency=current_currency_mode if current_currency_mode != "TWD" else None)
     if foreign_record:
@@ -1321,11 +1406,11 @@ def handle_event(event):
             reply_message(reply_token,
                 f"✅ 外幣{foreign_type}｜{foreign_record['item']} {amount_label} {currency}（{foreign_record['category']}）{date_note}\n"
                 f"📊 {total_title}：{total_label} {currency}\n"
-                "📒 已記錄到「外幣支出」工作表；只記錄原幣金額，不換算新台幣，也不計入新台幣統計。")
+                "📒 已記錄到「外幣」工作表；只記錄原幣金額，不換算新台幣，也不計入新台幣統計。")
             sys.stdout.write(f"[FOREIGN SHEETS] 寫入成功：{foreign_record}\n")
         except Exception as e:
             sys.stdout.write(f"[FOREIGN SHEETS] 寫入失敗：{e}\n")
-            reply_message(reply_token, f"⚠️ 外幣支出沒有成功寫入，請稍後再試。原因：{str(e)[:180]}")
+            reply_message(reply_token, f"⚠️ 外幣記錄沒有成功寫入，請稍後再試。原因：{str(e)[:180]}")
         return
 
     # 外幣模式下若有金額卻無法解析，禁止掉回新台幣帳本，避免誤記到一般支出表。
