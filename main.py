@@ -26,17 +26,28 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")  # 舊設定保留；個人分帳以 USER_SPREADSHEET_MAP 為準
 USER_SPREADSHEET_MAP_JSON = os.environ.get("USER_SPREADSHEET_MAP", "{}")
 
-# ===== 個人試算表設定：每位 LINE 使用者各自使用自己的試算表 =====
-# 每位 LINE userId 對應自己的試算表 ID 與既有記帳工作表名稱。
-# 股票工作表會自動建立在同一份試算表中，名稱為「股票_」+ 記帳工作表名稱。
+# ===== 個人試算表設定：之後要新增使用者／工作表，統一改這個區塊 =====
+# spreadsheet_id：該使用者自己的 Google 試算表 ID
+# main_worksheet：主要記帳表（支出／收入／刷卡）
+# worksheets.stock：股票功能使用的次要工作表
+# worksheets.foreign_currency：外幣支出功能使用的次要工作表
+# 注意：這裡只放 ID 與工作表名稱；LINE／Google／OpenAI 金鑰仍放 Render 環境變數。
 PERSONAL_SHEETS = {
     "U0a81f4b57639d3d599aced33392c506d": {
         "spreadsheet_id": "1-uumCTYnKuPsftwg6Lbriht5Y6vARJDIPnPuDcAmVes",
-        "worksheet_title": "Bu_506d",
+        "main_worksheet": "Bu_506d",
+        "worksheets": {
+            "stock": "股票_Bu_506d",
+            "foreign_currency": "外幣支出",
+        },
     },
     "U1b8bc5162bdf85af9b8bed34cd38abc4": {
         "spreadsheet_id": "1MeJRJ8RpixqJmpvO-0KeJAcmQfOJL62C_WmCIe2-Z7Q",
-        "worksheet_title": "Syuan_abc4",
+        "main_worksheet": "Syuan_abc4",
+        "worksheets": {
+            "stock": "股票_Syuan_abc4",
+            "foreign_currency": "外幣支出",
+        },
     },
 }
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")  # Google 服務帳戶 JSON（完整 JSON 文字）
@@ -76,6 +87,7 @@ MAIN_TYPES = ["支出", "收入", "刷卡"]
 
 HEADERS = ["日期", "時間", "記錄人", "收支", "項目", "內容", "金額", "備註"]
 STOCK_HEADERS = ["日期", "股票代號／名稱", "買賣方向", "股數", "成交單價", "成交金額", "備註"]
+FOREIGN_HEADERS = ["日期", "時間", "記錄人", "幣別", "項目", "金額（原幣）", "分類", "備註"]
 
 
 def now_tw():
@@ -117,7 +129,8 @@ def init_db():
             line_user_id TEXT PRIMARY KEY,
             wallet_balance INTEGER NOT NULL DEFAULT 0,
             account_balance INTEGER NOT NULL DEFAULT 0,
-            statement_day INTEGER NOT NULL DEFAULT 15
+            statement_day INTEGER NOT NULL DEFAULT 15,
+            currency_mode TEXT NOT NULL DEFAULT 'TWD'
         )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS transaction_meta (
             line_user_id TEXT NOT NULL,
@@ -132,9 +145,11 @@ def init_db():
             created_at TEXT NOT NULL
         )""")
         # 舊資料庫相容：補上初始餘額是否已寫入帳本的旗標
-        for column in ("wallet_initial_recorded", "account_initial_recorded"):
+        for column, definition in (("wallet_initial_recorded", "INTEGER NOT NULL DEFAULT 0"),
+                                   ("account_initial_recorded", "INTEGER NOT NULL DEFAULT 0"),
+                                   ("currency_mode", "TEXT NOT NULL DEFAULT 'TWD'")):
             try:
-                conn.execute(f"ALTER TABLE user_settings ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
+                conn.execute(f"ALTER TABLE user_settings ADD COLUMN {column} {definition}")
             except Exception:
                 pass
 
@@ -167,7 +182,19 @@ def get_user_spreadsheet_id(line_user_id):
 
 def get_user_worksheet_title(line_user_id):
     config = get_personal_sheet_config(line_user_id)
-    return str(config.get("worksheet_title", "")).strip()
+    # 新設定優先；保留舊版 worksheet_title 相容性。
+    return str(config.get("main_worksheet") or config.get("worksheet_title", "")).strip()
+
+
+def get_user_feature_worksheet_title(line_user_id, feature, default_title):
+    """讀取某個功能的次要工作表名稱；未設定時使用安全的預設名稱。"""
+    config = get_personal_sheet_config(line_user_id)
+    worksheets = config.get("worksheets", {})
+    if isinstance(worksheets, dict):
+        title = str(worksheets.get(feature, "")).strip()
+        if title:
+            return title[:100]
+    return default_title[:100]
 
 def user_is_linked(line_user_id):
     # 每位 LINE 使用者必須有自己的試算表對應，避免誤寫入別人的帳本。
@@ -251,6 +278,68 @@ def get_sheet(line_user_id):
     return ws
 
 
+
+def get_currency_mode(line_user_id):
+    """取得使用者目前記帳幣別；每位使用者獨立保存於 PostgreSQL。"""
+    with db_connect() as conn:
+        row = conn.execute("SELECT currency_mode FROM user_settings WHERE line_user_id=?", (line_user_id,)).fetchone()
+    mode = str(row["currency_mode"] if row else "TWD").upper() if row else "TWD"
+    return mode if mode in CURRENCY_ALIASES else "TWD"
+
+
+def set_currency_mode(line_user_id, currency):
+    """更新個人目前記帳幣別。"""
+    if currency not in CURRENCY_ALIASES:
+        currency = "TWD"
+    with db_connect() as conn:
+        conn.execute("""INSERT INTO user_settings(line_user_id, currency_mode) VALUES(?, ?)
+                     ON CONFLICT(line_user_id) DO UPDATE SET currency_mode=EXCLUDED.currency_mode""",
+                     (line_user_id, currency))
+
+
+def currency_command(text):
+    """只有單獨輸入幣別名稱（或『切換至人民幣』）才視為模式切換。"""
+    raw = re.sub(r"^[\s:：,，]+|[\s:：,，。]+$", "", str(text or "")).strip()
+    raw = re.sub(r"^(切換(?:到|至)?|改成|使用|記錄|記帳|外幣(?:支出|記帳)?)[\s:：,，-]*", "", raw, flags=re.I).strip()
+    code, alias = detect_currency(raw)
+    if not code:
+        return None
+    # 避免「人民幣奶茶 20」被當成單純切換指令；剩下的文字必須正好等於別名。
+    if raw.casefold() in {a.casefold() for a in CURRENCY_ALIASES[code]}:
+        return code
+    return None
+
+
+def classify_expense_category(item):
+    """先用明確規則；規則無法判斷時請 AI 依消費語意判斷，盡量不落入其他。"""
+    category = default_category(item, "支出")
+    if category != "其他":
+        return category
+    if not client:
+        return "其他"
+    try:
+        prompt = f"""你是繁體中文個人記帳分類助手。請只判斷這筆消費最合理的分類，回傳單一 JSON：{{\"category\":\"分類名稱\"}}。
+消費描述：{item}
+只能從以下選一個：{', '.join(EXPENSE_CATEGORIES)}
+判斷原則：
+- 先看使用者明確指定的用途；明確用途優先於品牌、角色、藝人名字。
+- 飲料、餐點、餐廳、手搖飲、咖啡、便當、零食歸餐飲。
+- 衛生用品、衛生棉、衛生紙、日常消耗品、家庭用品歸生活。
+- 盲盒、盲抽、扭蛋、抽賞、玩具、玩偶、娃娃、公仔、動漫／卡通角色商品、收藏品、專輯、小卡、偶像／藝人／團體相關消費、演唱會、遊戲娛樂，若沒有明確其他用途，一律歸娛樂休閒。陌生角色名或藝人名不可只因不認識就歸其他；結合「買、抽、專輯、玩具、周邊」等情境判斷。
+- 明確店家名稱可依店家類型判斷；超市、百貨、藥妝、五金、生活用品通路預設生活，餐飲與飲料品牌歸餐飲。
+- 訂閱、會員、影音／音樂服務、雲端、AI 服務、軟體月費歸訂閱服務。
+- 交通、醫療健康、美容保養、服飾、運動健身、旅遊、教育、保險、稅費、捐款公益依用途分類。
+- 只有在完全沒有足夠線索時才選其他。"""
+        response = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role":"user","content":prompt}], max_tokens=80, temperature=0)
+        raw = (response.choices[0].message.content or "").strip().replace("```json", "").replace("```", "").strip()
+        data = json.loads(raw)
+        result = str(data.get("category", "其他")).strip()
+        return result if result in EXPENSE_CATEGORIES else "其他"
+    except Exception as e:
+        sys.stdout.write(f"[CATEGORY AI] 分類失敗：{e}\n")
+        return "其他"
+
+
 def parse_date_hint(text):
     """先用明確規則辨識今天、昨天、前天及常見日期格式。"""
     today = now_tw().date()
@@ -328,7 +417,8 @@ def clean_main_prefix(text, main_type):
 
 
 def default_category(item, main_type):
-    s = item.lower()
+    """以固定關鍵字優先分類，減少常見項目呼叫 AI 後仍被歸到其他。"""
+    s = item.lower().replace("＋", "+")
     if main_type == "收入":
         if any(k in s for k in ["薪水", "薪資", "工資", "月薪"]):
             return "薪資"
@@ -340,28 +430,115 @@ def default_category(item, main_type):
             return "退款"
         if "利息" in s:
             return "利息"
-        if "投資" in s or "股息" in s or "配息" in s:
+        if any(k in s for k in ["投資", "股息", "配息"]):
             return "投資收入"
+        if any(k in s for k in ["補助", "津貼"]):
+            return "補助"
+        if any(k in s for k in ["兼職", "接案", "外快"]):
+            return "兼職收入"
         return "其他"
 
-    if "交卡費" in s or "繳卡費" in s or "繳信用卡" in s:
+    if any(k in s for k in ["交卡費", "繳卡費", "繳信用卡"]):
         return "繳卡費"
-    if "繳貸款" in s or "貸款還款" in s:
+    if any(k in s for k in ["繳貸款", "貸款還款"]):
         return "繳貸款"
+
+    # 明確寫出生活用途時，優先於角色／品牌名稱分類。
+    if any(k in s for k in ["生活用品", "日用品", "家用品", "居家用品", "衛生棉", "好自在", "夜用", "護墊", "衛生紙", "面紙", "清潔用品"]):
+        return "生活"
+
+    # 常見連鎖餐飲／飲料品牌：即使只輸入店名，也直接歸「餐飲」。
+    # 先判斷餐飲品牌，避免店名被後面的生活用品店規則搶先分類。
+    dining_brands = [
+        # 速食、漢堡、炸雞、披薩與常見連鎖餐廳
+        "麥當勞", "mcdonald", "肯德基", "kfc", "摩斯漢堡", "mos burger", "漢堡王", "burger king",
+        "頂呱呱", "拿坡里", "必勝客", "pizza hut", "達美樂", "domino's", "dominos",
+        "subway", "賽百味", "四海遊龍", "八方雲集", "三商巧福", "鬍鬚張", "梁社漢", "悟饕",
+        "爭鮮", "壽司郎", "藏壽司", "くら寿司", "築間", "肉多多", "石二鍋", "涮乃葉",
+        "錢都", "大戶屋", "定食8", "定食８", "春水堂", "鼎泰豐", "添好運", "瓦城",
+        "大心", "路易莎", "louisa", "星巴克", "starbucks", " cama", " cama cafe", " cama café",
+        "85度c", "85度Ｃ", " cama", " cama cafe", " cama café", " cama",
+        # 台灣常見手搖飲、茶飲與咖啡連鎖
+        "可不可", "可不可熟成茶行", "50嵐", "五十嵐", "清心福全", "清心", "大苑子", "麻古茶坊", "麻古",
+        "迷客夏", "coco都可", "co co都可", "coco", "茶之魔手", "茶の魔手", "鮮茶道", "得正",
+        "一沐日", "龜記", "龜記茗品", "萬波", "五桐號", "八曜和茶", "烏弄", "水巷茶弄",
+        "茶湯會", "喫茶趣", "先喝道", "大茗", "大明", "大苑子", "珍煮丹", "老賴茶棧",
+        "迷客夏", "再睡5分鐘", "再睡五分鐘", "日出茶太", "茶太", "comebuy", "貢茶", "春陽茶事",
+        "一手私藏", "得正", "上宇林", "叮哥", "茶聚", "歇腳亭", "ug樂己", "樂己", "milksha",
+        "teas原味", "tea's原味", "teas 原味", "tea's 原味", "幸福堂", "老虎堂", "鶴茶樓", "康青龍",
+        "星巴克", "路易莎", " cama", " cama cafe", " cama café", " cama",
+        # 直接描述餐飲店型的詞
+        "素食店", "素食餐廳", "自助餐店", "便當店", "早餐店", "飲料店", "手搖飲", "咖啡店", "餐廳"
+    ]
+    if any(k.strip() in s for k in dining_brands if k.strip()):
+        return "餐飲"
+
+    # 常見生活百貨、超市、藥妝與五金通路：只輸入店名也先歸「生活」。
+    lifestyle_stores = [
+        "全聯", "大全聯", "px mart", "大潤發", "愛買", "a.mart", "amart", "家樂福", "carrefour",
+        "寶雅", "poya", "小北百貨", "小北", "振宇五金", "特力屋", "h&d", "生活工場",
+        "大創", "daiso", "無印良品", "muji", "宜得利", "nitori", "美廉社", "simple mart",
+        "全家便利商店", "全家", "7-eleven", "7-11", "7－11", "統一超商", "萊爾富", "hi-life",
+        "ok超商", "okmart", "ok mart", "康是美", "cosmed", "屈臣氏", "watsons", "丁丁藥局",
+        "大樹藥局", "寶家", "特力和樂", "hola", "宜家家居", "ikea", "五金行", "五金百貨"
+    ]
+    if any(k in s for k in lifestyle_stores):
+        return "生活"
+
     if any(k in s for k in ["食材", "食物", "食品", "生鮮", "蔬菜", "水果", "肉類",
                              "海鮮", "零食", "點心", "飲料", "早餐", "午餐", "晚餐",
-                             "宵夜", "飯", "麵", "鍋", "滷味", "咖啡", "便當", "餐"]):
+                             "宵夜", "飯", "麵", "鍋", "滷味", "咖啡", "便當", "珍珠奶茶", "奶茶", "烏龍茶", "茶飲", "手搖", "餐"]):
         return "餐飲"
     if any(k in s for k in ["規費", "手續費", "辦理費", "地政", "戶政", "登記費", "代辦", "公證", "稅", "罰款"]):
         return "稅費"
-    if any(k in s for k in ["停車", "加油", "捷運", "公車", "火車", "高鐵", "計程車", "車資", "交通"]):
+    if any(k in s for k in ["悠遊卡", "一卡通", "icash", "停車", "加油", "捷運", "公車", "火車", "高鐵", "計程車", "車資", "交通"]):
         return "交通"
     if any(k in s for k in ["醫院", "診所", "藥", "看醫生", "掛號", "復健"]):
         return "醫療健康"
-    if any(k in s for k in ["保險"]):
+    if "保險" in s:
         return "保險"
-    if any(k in s for k in ["訂閱", "會員", "月費", "netflix", "spotify", "claude", "chatgpt"]):
+    if any(k in s for k in ["保養品", "化妝品", "化妝水", "乳液", "口紅", "美容", "美甲"]):
+        return "美容保養"
+    if any(k in s for k in ["衣服", "褲子", "裙子", "鞋子", "襪子", "包包", "帽子", "服飾"]):
+        return "服飾"
+    if any(k in s for k in ["健身房", "健身", "瑜伽", "瑜珈", "運動課", "運動用品"]):
+        return "運動健身"
+    if any(k in s for k in ["機票", "住宿", "飯店", "旅館", "旅行", "旅遊", "民宿"]):
+        return "旅遊"
+    if any(k in s for k in ["課程", "學費", "教材", "補習", "教科書", "線上課"]):
+        return "教育"
+
+    # 訂閱服務：串流影音、雲端空間、AI 會員、軟體與網站主機服務。
+    if any(k in s for k in [
+        "訂閱", "會員", "月費", "年費", "續費", "方案費", "premium", "plus方案", "go方案",
+        "netflix", "disney+", "disney plus", "spotify", "apple icloud", "icloud", "icloud+",
+        "youtube premium", "youtube music", "愛奇藝", "奇藝", "優酷", "youku", "騰訊視頻",
+        "騰訊视频", "騰訊會員", "芒果tv", "芒果tv", "芒果會員", "抖音會員",
+        "chatgpt", "gpt go", "gptgo", "openai", "claude", "gemini advanced", "copilot pro",
+        "render", "cloudflare", "vercel", "heroku", "hosting", "hosting fee", "subscription",
+        "雲端空間", "雲端容量", "儲存空間升級", "軟體訂閱", "軟體會員", "影音會員", "串流會員"
+    ]):
         return "訂閱服務"
+
+    # 生活：使用者說「工具」時，預設指實體小工具與生活耗材，不是軟體。
+    if any(k in s for k in [
+        "工具", "刷子", "螺絲", "螺絲釘", "螺絲起子", "螺絲批", "扳手", "鉗子", "槌子", "錘子",
+        "尺", "剪刀", "美工刀", "膠帶", "膠水", "電池", "延長線", "充電線", "插頭", "插座",
+        "燈泡", "收納盒", "收納袋", "收納用品", "日用品", "生活用品", "家用品", "清潔用品",
+        "衛生紙", "面紙", "抽取式衛生紙", "衛生棉", "好自在", "護墊", "垃圾袋", "洗衣精", "洗衣液", "洗碗精", "抹布",
+        "曬衣架", "衣架", "海綿", "菜瓜布", "拖把", "掃把", "垃圾桶", "保鮮膜", "鋁箔紙",
+        "夾鏈袋", "紙巾", "濕紙巾", "棉花棒", "牙籤", "牙刷", "牙膏", "洗手乳", "洗手液"
+    ]):
+        return "生活"
+
+    # 娛樂休閒：追星、收藏、玩偶玩具、門票與遊戲消費。
+    if any(k in s for k in [
+        "盲盒", "盲抽", "抽盲盒", "扭蛋", "抽賞", "一番賞", "玩偶", "玩具", "娃娃", "公仔", "模型", "絨毛", "毛絨", "布偶", "抱枕玩偶", "烏薩奇",
+        "周邊", "周邊商品", "應援物", "專輯", "唱片", "小卡", "卡冊", "寫真", "追星",
+        "演唱會", "門票", "音樂祭", "粉絲見面會", "見面會", "電影票", "電影", "戲票",
+        "展覽票", "遊樂園", "桌遊", "電玩", "遊戲點數", "遊戲儲值", "直播打賞", "抖幣", "抖币"
+    ]):
+        return "娛樂休閒"
     return "其他"
 
 
@@ -416,7 +593,11 @@ def parse_record(text):
 - 支出與刷卡沿用相同小項目。
 - 含食材、食物、食品、生鮮、蔬菜、水果、肉類、海鮮、零食、點心、飲料、早餐、午餐、晚餐、宵夜、飯、麵、鍋、滷味、便當、咖啡等詞，歸「餐飲」。
 - 含規費、手續費、辦理費、地政、戶政、登記費、代辦、公證、稅、罰款等詞，歸「稅費」。
-- 停車、捷運、公車、加油、車資等交通項目，歸「交通」。
+- 悠遊卡（即使只輸入「悠遊卡」，也視為悠遊卡儲值／交通支出）、一卡通、icash、停車、捷運、公車、加油、車資等交通項目，歸「交通」。
+- 娛樂休閒包含追星、收藏及現場活動：盲盒、盲抽、扭蛋、抽賞、玩偶、玩具、娃娃、公仔、模型、周邊、應援物、專輯、唱片、小卡、卡冊、寫真、演唱會、門票、粉絲見面會、電影票、展覽票、遊樂園、桌遊、電玩、遊戲儲值、直播打賞等，統一歸「娛樂休閒」，不要歸「其他」。卡通／動漫角色名稱、玩具系列名稱、偶像／藝人／團體名稱，若是在購物記帳情境且沒有明確指定其他用途，優先判為娛樂休閒；不要要求使用者一定要寫出「周邊」或「專輯」。如果使用者明確寫出「生活用品、衛生用品」等實際用途，則用途優先。
+- 訂閱服務包含國內外影音／音樂會員與數位服務：Netflix、Disney+、Apple iCloud／iCloud+、YouTube Premium、Spotify、愛奇藝、優酷、騰訊視頻、芒果TV、ChatGPT Plus／Go、OpenAI、Claude、Render、Cloudflare、Vercel 等；雲端空間升級、會員、月費、年費、軟體訂閱、網站部署／主機服務都歸「訂閱服務」。不要因品牌來自哪個國家而改分類。
+- 生活包含一般實體工具與日常耗材：工具、刷子、螺絲／螺絲釘、電池、剪刀、膠帶、插頭、燈泡、面紙、衛生紙、垃圾袋、清潔用品、收納用品、牙刷、牙膏等，統一歸「生活」。使用者只說「工具」時，預設是實體工具，不要當成軟體工具。
+- 若使用者明確說出軟體／平台名稱，依其品牌關鍵字判斷，不要只因有「工具」二字就歸生活。
 - 「繳卡費／繳信用卡」若大項目是支出，類別選「繳卡費」。
 - 不要把刷卡消費當成支出；如果訊息開頭明確是「刷卡」，大項目已是刷卡。
 - 若沒有金額或不是記帳內容，回傳 {{"item":"","amount":0,"category":"其他"}}。
@@ -435,7 +616,15 @@ def parse_record(text):
         amount = int(data.get("amount", 0))
         category = str(data.get("category", "其他")).strip()
         allowed = INCOME_CATEGORIES if main_type == "收入" else (CARD_CATEGORIES if main_type == "刷卡" else EXPENSE_CATEGORIES)
-        if not item or amount <= 0 or category not in allowed:
+        if not item or amount <= 0:
+            return fallback_parse(text)
+        # 明確關鍵字分類優先於 AI 判斷，避免訂閱服務、生活用品與娛樂收藏被誤判為「其他」。
+        if main_type != "收入":
+            forced_category = default_category(item, main_type)
+            # default_category 是唯一的明確關鍵字規則來源，避免兩份清單不同步。
+            if forced_category != "其他":
+                category = forced_category
+        if category not in allowed:
             return fallback_parse(text)
         return {
             "date": target_date.isoformat(),
@@ -545,6 +734,119 @@ def save_record(line_user_id, sender, record, payment_method="bank"):
         conn.execute("""INSERT INTO transaction_meta(line_user_id,sheet_row,payment_method) VALUES(?,?,?)
                      ON CONFLICT(line_user_id,sheet_row) DO UPDATE SET payment_method=EXCLUDED.payment_method""",
                      (line_user_id, sheet_row, payment_method))
+
+
+# ===== 外幣支出：只記錄原幣，不換算新台幣 =====
+CURRENCY_ALIASES = {
+    "USD": ["美元", "美金", "美國幣", "USD", "US dollar", "US dollars", "dollar", "dollars"],
+    "CNY": ["人民幣", "人民币", "RMB", "CNY", "中國幣", "人仔"],
+    "JPY": ["日幣", "日币", "日圓", "日元", "円", "JPY", "日幣"] ,
+    "KRW": ["韓幣", "韩币", "韓元", "韩元", "KRW", "韓國幣"],
+    "HKD": ["港幣", "港币", "港元", "HKD"],
+    "EUR": ["歐元", "欧元", "EUR"],
+    "GBP": ["英鎊", "英镑", "GBP", "英鎊"],
+    "SGD": ["新加坡幣", "新加坡币", "新幣", "新币", "SGD"],
+    "THB": ["泰銖", "泰铢", "THB"],
+    "AUD": ["澳幣", "澳币", "澳元", "AUD"],
+    "CAD": ["加幣", "加币", "加元", "CAD"],
+    "VND": ["越南盾", "VND"],
+    "PHP": ["披索", "菲律賓披索", "菲律宾比索", "PHP"],
+    "TWD": ["新台幣", "台幣", "台币", "TWD"],
+}
+
+
+def detect_currency(text):
+    """從常見中英文叫法辨識幣別；回傳 ISO 幣別碼與實際匹配文字。"""
+    s = str(text or "")
+    candidates = []
+    for code, aliases in CURRENCY_ALIASES.items():
+        for alias in aliases:
+            candidates.append((alias, code))
+    # 長字串先比對，避免「港幣」等被較短詞搶先命中。
+    for alias, code in sorted(candidates, key=lambda x: len(x[0]), reverse=True):
+        if re.search(rf"(?<![A-Za-z]){re.escape(alias)}(?![A-Za-z])" if alias.isascii() else re.escape(alias), s, re.I):
+            return code, alias
+    return None, None
+
+
+def parse_foreign_record(text, active_currency=None):
+    """解析外幣支出：可在訊息中指定幣別，或沿用使用者已切換的幣別模式。"""
+    target_date, cleaned = parse_date_hint(text)
+    detected_currency, _alias = detect_currency(cleaned)
+    # 明確提到新台幣時不可以誤記到外幣工作表；一般支出解析會接手。
+    if detected_currency == "TWD":
+        return None
+    currency = detected_currency if detected_currency else active_currency
+    if not currency or currency == "TWD":
+        return None
+
+    item_text = cleaned
+    # 若本筆有明確幣別，就移除所有幣別別名；處於持續模式時，移除外幣提示即可。
+    if detected_currency and detected_currency != "TWD":
+        for aliases in CURRENCY_ALIASES.values():
+            for word in sorted(aliases, key=len, reverse=True):
+                item_text = re.sub(rf"(?<![A-Za-z]){re.escape(word)}(?![A-Za-z])" if word.isascii() else re.escape(word), " ", item_text, flags=re.I)
+    item_text = re.sub(r"外幣(?:支出|記帳)?", " ", item_text, flags=re.I)
+    item_text = re.sub(r"^[\s:：,，$＄]+|[\s:：,，$＄]+$", "", item_text)
+    match = re.search(r"^(.*?)[\s$＄,，:：|｜-]*(\d[\d,]*(?:\.\d+)?)\s*(?:元|塊|塊錢)?$", item_text)
+    if not match:
+        return None
+    item = match.group(1).strip(" ，,。:：|｜-") or "未註明項目"
+    amount_text = match.group(2).replace(",", "")
+    try:
+        amount = float(amount_text)
+    except ValueError:
+        return None
+    if amount <= 0:
+        return None
+    category = classify_expense_category(item)
+    return {"date": target_date.isoformat(), "currency": currency, "item": item,
+            "amount": amount, "category": category}
+
+def get_foreign_sheet(line_user_id):
+    """在該使用者自己的試算表中建立／取得「外幣支出」工作表。"""
+    if not line_user_id:
+        raise RuntimeError("無法辨識 LINE 使用者 ID")
+    spreadsheet_id = get_user_spreadsheet_id(line_user_id)
+    if not spreadsheet_id:
+        raise RuntimeError("尚未設定你的個人試算表。")
+    sh = shared_google_client().open_by_key(spreadsheet_id)
+    title = get_user_feature_worksheet_title(line_user_id, "foreign_currency", "外幣支出")
+    try:
+        ws = sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=title, rows="2000", cols=str(len(FOREIGN_HEADERS)))
+        ws.update("A1", [FOREIGN_HEADERS])
+    values = ws.get_all_values()
+    if not values:
+        ws.update("A1", [FOREIGN_HEADERS])
+    elif values[0] != FOREIGN_HEADERS:
+        raise RuntimeError(f"工作表「{title}」欄位與程式不一致，請先確認欄位。")
+    return ws
+
+
+def save_foreign_record(line_user_id, sender, record):
+    ws = get_foreign_sheet(line_user_id)
+    amount = record["amount"]
+    amount_value = int(amount) if float(amount).is_integer() else amount
+    ws.append_row([
+        record["date"], now_tw().strftime("%H:%M"), sender, record["currency"],
+        record["item"], amount_value, record["category"], ""
+    ], value_input_option="USER_ENTERED")
+    # 回傳同幣別累積金額；不換算、不併入新台幣統計。
+    rows = ws.get_all_records()
+    total = 0.0
+    for row in rows:
+        if str(row.get("幣別", "")).upper() == record["currency"] and str(row.get("日期", "")).startswith(now_tw().strftime("%Y-%m")):
+            try:
+                total += float(str(row.get("金額（原幣）", 0)).replace(",", ""))
+            except (ValueError, TypeError):
+                pass
+    return total
+
+
+def format_foreign_amount(amount):
+    return f"{int(amount):,}" if float(amount).is_integer() else f"{amount:,.2f}".rstrip("0").rstrip(".")
 
 
 def query_stats(line_user_id, period):
@@ -724,6 +1026,7 @@ WELCOME_MESSAGE = """🎉 歡迎使用「記帳小工具」！💚
 
 • 午餐 100：記錄一般支出（預設從銀行帳戶扣除）
 • 刷卡 買衣服 890：記錄信用卡消費
+• 日幣 拉麵 1200：記錄外幣支出，只記原幣金額，不換算台幣
 • 收入 薪水 28000：記錄收入
 • 繳貸款 5704：記錄貸款繳費
 • 繳卡費 5000：記錄信用卡繳費
@@ -749,6 +1052,9 @@ HELP_MESSAGE = """小工具可以做到的事🩵
 ・記支出：午餐 100、買衣服 890
 ・記收入：收入 薪水 28000
 ・記刷卡：刷卡 買衣服 890
+・切換外幣模式：單獨輸入「人民幣／日幣／美金／韓元」等幣別名稱；之後的支出會持續記到「外幣支出」工作表，只記原幣金額、不換算台幣。
+・切回日常記帳：單獨輸入「新台幣」，之後恢復寫入原本支出工作表。
+・也可以單筆記外幣：日幣 拉麵 1200、人民幣 咖啡 28、美金 午餐 12.5
 ・記每月還款：繳貸款 5704、繳卡費 5000
 ・忘記沒關係可以補上日期：昨天 午餐 100、10/20 晚餐 150
 ・打錯了：刪除（刪掉自己最後一筆記帳）
@@ -768,7 +1074,9 @@ HELP_MESSAGE = """小工具可以做到的事🩵
 def get_stock_sheet(line_user_id):
     """使用現有 LINE 使用者身分，建立／取得該使用者專屬股票分頁。"""
     accounting_ws = get_sheet(line_user_id)
-    title = f"股票_{accounting_ws.title}"[:100]
+    title = get_user_feature_worksheet_title(
+        line_user_id, "stock", f"股票_{accounting_ws.title}"
+    )
     spreadsheet_id = get_user_spreadsheet_id(line_user_id)
     if not spreadsheet_id:
         raise RuntimeError("尚未設定你的個人試算表，請管理員檢查 USER_SPREADSHEET_MAP。")
@@ -902,6 +1210,16 @@ def handle_event(event):
             reply_message(reply_token, "⚠️ 這個 LINE 帳號還沒有綁定個人試算表，這筆尚未記錄。請私訊管理員提供「我的ID」，完成 USER_SPREADSHEET_MAP 設定後再試。")
         return
 
+    # 幣別模式切換：狀態按 LINE 使用者分開保存，重啟服務後仍會延續。
+    requested_currency = currency_command(text)
+    if requested_currency:
+        set_currency_mode(line_user_id, requested_currency)
+        if requested_currency == "TWD":
+            reply_message(reply_token, "✅ 已切回新台幣日常記帳模式。\n接下來的支出會寫入原本的記帳工作表。")
+        else:
+            reply_message(reply_token, f"✅ 已切換至 {requested_currency} 外幣記帳模式。\n接下來的支出會持續寫入「外幣支出」工作表，只記錄原幣金額、不換算新台幣。\n要結束外幣模式時，單獨輸入「新台幣」即可。")
+        return
+
     setting_match = re.fullmatch(r"(錢包餘額|帳戶餘額|信用卡結算日)\s*[:：]?\s*(\d+)", text)
     if setting_match:
         setting_name, value_text = setting_match.groups()
@@ -964,8 +1282,36 @@ def handle_event(event):
             reply_message(reply_token, f"⚠️ 刪除失敗，請稍後再試。原因：{str(e)[:180]}")
         return
 
+    # 明確提到非新台幣幣別時，獨立寫入「外幣支出」，不納入新台幣帳本統計。
+    current_currency_mode = get_currency_mode(line_user_id)
+    foreign_record = parse_foreign_record(text, active_currency=current_currency_mode if current_currency_mode != "TWD" else None)
+    if foreign_record:
+        try:
+            foreign_total = save_foreign_record(line_user_id, sender, foreign_record)
+            amount_label = format_foreign_amount(foreign_record["amount"])
+            total_label = format_foreign_amount(foreign_total)
+            currency = foreign_record["currency"]
+            date_note = f"\n📅 記錄日期：{foreign_record['date']}" if foreign_record["date"] != now_tw().date().isoformat() else ""
+            reply_message(reply_token,
+                f"✅ 外幣支出｜{foreign_record['item']} {amount_label} {currency}（{foreign_record['category']}）{date_note}\n"
+                f"📊 本月外幣支出累積：{total_label} {currency}\n"
+                "📒 已記錄到「外幣支出」工作表；不換算新台幣，也不計入新台幣支出統計。")
+            sys.stdout.write(f"[FOREIGN SHEETS] 寫入成功：{foreign_record}\n")
+        except Exception as e:
+            sys.stdout.write(f"[FOREIGN SHEETS] 寫入失敗：{e}\n")
+            reply_message(reply_token, f"⚠️ 外幣支出沒有成功寫入，請稍後再試。原因：{str(e)[:180]}")
+        return
+
     payment_method = "bank"
     parse_text = text
+    # 使用者在外幣模式中明確寫出新台幣，也視為結束外幣模式；若同句有消費，照常記入新台幣帳本。
+    explicit_currency, _explicit_alias = detect_currency(parse_text)
+    if explicit_currency == "TWD":
+        if current_currency_mode != "TWD":
+            set_currency_mode(line_user_id, "TWD")
+        for alias in sorted(CURRENCY_ALIASES["TWD"], key=len, reverse=True):
+            parse_text = re.sub(rf"(?<![A-Za-z]){re.escape(alias)}(?![A-Za-z])" if alias.isascii() else re.escape(alias), " ", parse_text, flags=re.I)
+        parse_text = re.sub(r"\s+", " ", parse_text).strip()
     if re.match(r"^現金(?:\s|[:：])", parse_text):
         payment_method = "cash"
         parse_text = re.sub(r"^現金\s*[:：]?\s*", "", parse_text)
