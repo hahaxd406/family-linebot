@@ -37,7 +37,7 @@ PERSONAL_SHEETS = {
         "spreadsheet_id": "1-uumCTYnKuPsftwg6Lbriht5Y6vARJDIPnPuDcAmVes",
         "main_worksheet": "Bu_506d",
         "worksheets": {
-            "stock": "股票",
+            "stock": "股票_Bu_506d",
             "foreign_currency": "外幣支出",
         },
     },
@@ -45,16 +45,16 @@ PERSONAL_SHEETS = {
         "spreadsheet_id": "1MeJRJ8RpixqJmpvO-0KeJAcmQfOJL62C_WmCIe2-Z7Q",
         "main_worksheet": "Syuan_abc4",
         "worksheets": {
-            "stock": "股票",
+            "stock": "股票_Syuan_abc4",
             "foreign_currency": "外幣支出",
         },
     },
+    # 第三位朋友：主要工作表未指定時，程式會依 LINE 顯示名稱自動建立／取得。
     "U5ff9728b5d981070890d63b610a7b834": {
         "spreadsheet_id": "1JegFHHQfZ5nV3WlL0dRrVAwbVlP8-t9mFFLn2a0WR20",
         "worksheets": {
-            
-            "stock": "股票",
             "foreign_currency": "外幣支出",
+            # 股票工作表未指定時，會自動使用「股票_<主要工作表名稱>」。
         },
     },
 }
@@ -152,14 +152,11 @@ def init_db():
             worksheet_title TEXT NOT NULL,
             created_at TEXT NOT NULL
         )""")
-        # 舊資料庫相容：補上初始餘額是否已寫入帳本的旗標
-        for column, definition in (("wallet_initial_recorded", "INTEGER NOT NULL DEFAULT 0"),
-                                   ("account_initial_recorded", "INTEGER NOT NULL DEFAULT 0"),
-                                   ("currency_mode", "TEXT NOT NULL DEFAULT 'TWD'")):
-            try:
-                conn.execute(f"ALTER TABLE user_settings ADD COLUMN {column} {definition}")
-            except Exception:
-                pass
+        # 舊資料庫相容：使用 PostgreSQL 原生 IF NOT EXISTS，避免重複欄位錯誤
+        # 造成交易進入 aborted 狀態，後續 SQL 全部失敗。
+        conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS wallet_initial_recorded INTEGER NOT NULL DEFAULT 0")
+        conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS account_initial_recorded INTEGER NOT NULL DEFAULT 0")
+        conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS currency_mode TEXT NOT NULL DEFAULT 'TWD'")
 
 
 
