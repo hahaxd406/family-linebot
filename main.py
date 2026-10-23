@@ -37,7 +37,7 @@ PERSONAL_SHEETS = {
         "spreadsheet_id": "1-uumCTYnKuPsftwg6Lbriht5Y6vARJDIPnPuDcAmVes",
         "main_worksheet": "Bu_506d",
         "worksheets": {
-            "stock": "股票_Bu_506d",
+            "stock": "股票",
             "foreign_currency": "外幣支出",
         },
     },
@@ -45,7 +45,15 @@ PERSONAL_SHEETS = {
         "spreadsheet_id": "1MeJRJ8RpixqJmpvO-0KeJAcmQfOJL62C_WmCIe2-Z7Q",
         "main_worksheet": "Syuan_abc4",
         "worksheets": {
-            "stock": "股票_Syuan_abc4",
+            "stock": "股票",
+            "foreign_currency": "外幣支出",
+        },
+    },
+    "U5ff9728b5d981070890d63b610a7b834": {
+        "spreadsheet_id": "1JegFHHQfZ5nV3WlL0dRrVAwbVlP8-t9mFFLn2a0WR20",
+        "worksheets": {
+            
+            "stock": "股票",
             "foreign_currency": "外幣支出",
         },
     },
@@ -87,7 +95,7 @@ MAIN_TYPES = ["支出", "收入", "刷卡"]
 
 HEADERS = ["日期", "時間", "記錄人", "收支", "項目", "內容", "金額", "備註"]
 STOCK_HEADERS = ["日期", "股票代號／名稱", "買賣方向", "股數", "成交單價", "成交金額", "備註"]
-FOREIGN_HEADERS = ["日期", "時間", "記錄人", "幣別", "項目", "金額（原幣）", "分類", "備註"]
+FOREIGN_HEADERS = ["日期", "時間", "記錄人", "收支", "項目", "內容", "幣別", "金額", "備註"]
 
 
 def now_tw():
@@ -770,10 +778,10 @@ def detect_currency(text):
 
 
 def parse_foreign_record(text, active_currency=None):
-    """解析外幣支出：可在訊息中指定幣別，或沿用使用者已切換的幣別模式。"""
+    """解析外幣支出或收入；使用者切換幣別後，持續沿用該幣別。"""
     target_date, cleaned = parse_date_hint(text)
     detected_currency, _alias = detect_currency(cleaned)
-    # 明確提到新台幣時不可以誤記到外幣工作表；一般支出解析會接手。
+    # 明確提到新台幣時交給一般記帳流程處理。
     if detected_currency == "TWD":
         return None
     currency = detected_currency if detected_currency else active_currency
@@ -781,27 +789,48 @@ def parse_foreign_record(text, active_currency=None):
         return None
 
     item_text = cleaned
-    # 若本筆有明確幣別，就移除所有幣別別名；處於持續模式時，移除外幣提示即可。
+    # 移除訊息內的幣別名稱，避免被當成消費項目。
     if detected_currency and detected_currency != "TWD":
         for aliases in CURRENCY_ALIASES.values():
             for word in sorted(aliases, key=len, reverse=True):
                 item_text = re.sub(rf"(?<![A-Za-z]){re.escape(word)}(?![A-Za-z])" if word.isascii() else re.escape(word), " ", item_text, flags=re.I)
-    item_text = re.sub(r"外幣(?:支出|記帳)?", " ", item_text, flags=re.I)
+    item_text = re.sub(r"外幣(?:支出|收入|記帳)?", " ", item_text, flags=re.I)
     item_text = re.sub(r"^[\s:：,，$＄]+|[\s:：,，$＄]+$", "", item_text)
+
+    # 沿用台幣記帳的收支判斷與前綴：例如「收入 退款 100」或「早餐100」。
+    main_type = infer_main_type(item_text)
+    item_text = clean_main_prefix(item_text, main_type)
     match = re.search(r"^(.*?)[\s$＄,，:：|｜-]*(\d[\d,]*(?:\.\d+)?)\s*(?:元|塊|塊錢)?$", item_text)
     if not match:
         return None
-    item = match.group(1).strip(" ，,。:：|｜-") or "未註明項目"
+    item = match.group(1).strip(" ，,。:：|｜-")
     amount_text = match.group(2).replace(",", "")
+    if not item:
+        return None
     try:
         amount = float(amount_text)
     except ValueError:
         return None
     if amount <= 0:
         return None
-    category = classify_expense_category(item)
-    return {"date": target_date.isoformat(), "currency": currency, "item": item,
-            "amount": amount, "category": category}
+
+    if main_type == "收入":
+        category = default_category(item, "收入")
+        if category == "其他" and client:
+            try:
+                prompt = "你是繁體中文記帳分類助手。請只從以下收入分類選一個，回傳 JSON：{\"category\":\"分類名稱\"}。\n收入內容：" + item + "\n可選分類：" + ", ".join(INCOME_CATEGORIES)
+                response = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], max_tokens=80, temperature=0)
+                raw = (response.choices[0].message.content or "{}").replace("```json", "").replace("```", "").strip()
+                data = json.loads(raw)
+                candidate = str(data.get("category", "其他")).strip()
+                if candidate in INCOME_CATEGORIES:
+                    category = candidate
+            except Exception as e:
+                sys.stdout.write(f"[FOREIGN INCOME CATEGORY] 分類備援：{e}\n")
+    else:
+        category = classify_expense_category(item)
+    return {"date": target_date.isoformat(), "currency": currency, "main_type": main_type,
+            "item": item, "amount": amount, "category": category}
 
 def get_foreign_sheet(line_user_id):
     """在該使用者自己的試算表中建立／取得「外幣支出」工作表。"""
@@ -821,7 +850,13 @@ def get_foreign_sheet(line_user_id):
     if not values:
         ws.update("A1", [FOREIGN_HEADERS])
     elif values[0] != FOREIGN_HEADERS:
-        raise RuntimeError(f"工作表「{title}」欄位與程式不一致，請先確認欄位。")
+        # 若這張分頁只有一列表頭（例如舊版誤建成一般帳本表頭），可安全修正表頭；
+        # 若已有任何資料列，絕不自動覆蓋，避免破壞使用者資料。
+        if len(values) == 1:
+            ws.update("A1", [FOREIGN_HEADERS])
+            sys.stdout.write(f"[FOREIGN SHEETS] 已修正空白工作表「{title}」的表頭\n")
+        else:
+            raise RuntimeError(f"工作表「{title}」已有資料但欄位與外幣表不一致；為避免破壞資料，程式沒有覆蓋。請先備份並確認分頁。")
     return ws
 
 
@@ -829,21 +864,25 @@ def save_foreign_record(line_user_id, sender, record):
     ws = get_foreign_sheet(line_user_id)
     amount = record["amount"]
     amount_value = int(amount) if float(amount).is_integer() else amount
+    main_type = record.get("main_type", "支出")
+    # 欄位沿用原本記帳表的「收支／項目／內容」概念，僅在金額前新增幣別欄。
     ws.append_row([
-        record["date"], now_tw().strftime("%H:%M"), sender, record["currency"],
-        record["item"], amount_value, record["category"], ""
+        record["date"], now_tw().strftime("%H:%M"), sender, main_type,
+        record["category"], record["item"], record["currency"], amount_value, ""
     ], value_input_option="USER_ENTERED")
-    # 回傳同幣別累積金額；不換算、不併入新台幣統計。
+    # 分開計算同幣別、同收支類型的本月累積；只做加總，不做匯率換算。
     rows = ws.get_all_records()
     total = 0.0
+    current_month = now_tw().strftime("%Y-%m")
     for row in rows:
-        if str(row.get("幣別", "")).upper() == record["currency"] and str(row.get("日期", "")).startswith(now_tw().strftime("%Y-%m")):
+        if (str(row.get("幣別", "")).upper() == record["currency"]
+                and str(row.get("收支", "支出")) == main_type
+                and str(row.get("日期", "")).startswith(current_month)):
             try:
-                total += float(str(row.get("金額（原幣）", 0)).replace(",", ""))
+                total += float(str(row.get("金額", 0)).replace(",", ""))
             except (ValueError, TypeError):
                 pass
     return total
-
 
 def format_foreign_amount(amount):
     return f"{int(amount):,}" if float(amount).is_integer() else f"{amount:,.2f}".rstrip("0").rstrip(".")
@@ -1176,6 +1215,12 @@ def handle_event(event):
         reply_message(reply_token, HELP_MESSAGE)
         return
 
+    # 先辨識單獨輸入的幣別名稱。若帳號尚未綁定，明確告知原因，不要讓「美金」看起來沒反應。
+    requested_currency = currency_command(text)
+    if requested_currency and not user_is_linked(line_user_id):
+        reply_message(reply_token, "⚠️ 這個 LINE 帳號尚未完成個人試算表／資料庫設定，幣別模式沒有切換。請先完成帳號綁定後再試。")
+        return
+
     # 個人分帳模式：每個 LINE 使用者只能操作映射給自己的試算表。
     if not user_is_linked(line_user_id):
         # 一般閒聊不提示設定錯誤，避免群組洗版；但記帳格式必須明確告知原因，不能靜默忽略。
@@ -1189,13 +1234,17 @@ def handle_event(event):
         return
 
     # 幣別模式切換：狀態按 LINE 使用者分開保存，重啟服務後仍會延續。
-    requested_currency = currency_command(text)
+    # 切換失敗時明確回覆錯誤，避免使用者以為已切換，後續卻誤記到新台幣帳本。
     if requested_currency:
-        set_currency_mode(line_user_id, requested_currency)
-        if requested_currency == "TWD":
-            reply_message(reply_token, "✅ 已切回新台幣日常記帳模式。\n接下來的支出會寫入原本的記帳工作表。")
-        else:
-            reply_message(reply_token, f"✅ 已切換至 {requested_currency} 外幣記帳模式。\n接下來的支出會持續寫入「外幣支出」工作表，只記錄原幣金額、不換算新台幣。\n要結束外幣模式時，單獨輸入「新台幣」即可。")
+        try:
+            set_currency_mode(line_user_id, requested_currency)
+            if requested_currency == "TWD":
+                reply_message(reply_token, "✅ 已切回新台幣日常記帳模式。\n接下來的支出會寫入原本的記帳工作表。")
+            else:
+                reply_message(reply_token, f"✅ 已切換至 {requested_currency} 外幣記帳模式！\n現在可以開始記錄外幣支出或收入，例如：早餐 100、收入 退款 50。\n接下來會寫入「外幣支出」工作表，保留你選擇的幣別與原幣金額，不換算新台幣，也不併入台幣統計。\n要切回日常記帳，請單獨輸入「新台幣」。")
+        except Exception as e:
+            sys.stdout.write(f"[CURRENCY MODE] 切換失敗：{e}\n")
+            reply_message(reply_token, f"⚠️ 幣別模式切換失敗，這次沒有切換成功，因此請先不要輸入消費。原因：{str(e)[:180]}")
         return
 
     setting_match = re.fullmatch(r"(錢包餘額|帳戶餘額|信用卡結算日)\s*[:：]?\s*(\d+)", text)
@@ -1270,14 +1319,22 @@ def handle_event(event):
             total_label = format_foreign_amount(foreign_total)
             currency = foreign_record["currency"]
             date_note = f"\n📅 記錄日期：{foreign_record['date']}" if foreign_record["date"] != now_tw().date().isoformat() else ""
+            foreign_type = foreign_record.get("main_type", "支出")
+            total_title = "本月外幣收入累積" if foreign_type == "收入" else "本月外幣支出累積"
             reply_message(reply_token,
-                f"✅ 外幣支出｜{foreign_record['item']} {amount_label} {currency}（{foreign_record['category']}）{date_note}\n"
-                f"📊 本月外幣支出累積：{total_label} {currency}\n"
-                "📒 已記錄到「外幣支出」工作表；不換算新台幣，也不計入新台幣支出統計。")
+                f"✅ 外幣{foreign_type}｜{foreign_record['item']} {amount_label} {currency}（{foreign_record['category']}）{date_note}\n"
+                f"📊 {total_title}：{total_label} {currency}\n"
+                "📒 已記錄到「外幣支出」工作表；只記錄原幣金額，不換算新台幣，也不計入新台幣統計。")
             sys.stdout.write(f"[FOREIGN SHEETS] 寫入成功：{foreign_record}\n")
         except Exception as e:
             sys.stdout.write(f"[FOREIGN SHEETS] 寫入失敗：{e}\n")
             reply_message(reply_token, f"⚠️ 外幣支出沒有成功寫入，請稍後再試。原因：{str(e)[:180]}")
+        return
+
+    # 外幣模式下若有金額卻無法解析，禁止掉回新台幣帳本，避免誤記到一般支出表。
+    explicit_currency_for_safety, _ = detect_currency(text)
+    if current_currency_mode != "TWD" and explicit_currency_for_safety != "TWD" and re.search(r"\d[\d,]*(?:\.\d+)?\s*(?:元|塊|塊錢)?\s*$", text):
+        reply_message(reply_token, "⚠️ 目前仍在外幣記帳模式，但這筆格式我無法辨識，所以沒有寫入任何工作表。請試試「早餐 100」或「昨天 拉麵 1200」；要記新台幣請先輸入「新台幣」。")
         return
 
     payment_method = "bank"
