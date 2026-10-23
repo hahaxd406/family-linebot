@@ -448,8 +448,8 @@ def infer_main_type(text):
     if re.search(r"^(支出|花費|付款)(?:\s|[:：,，|｜-]|$)", s):
         return "支出"
 
-    # 明確收入項目
-    if re.search(r"(薪資|薪水|工資|獎金|利息收入|投資收入|兼職收入|收到紅包|收入|退款入帳)", s):
+    # 明確收入項目（外幣與新台幣共用同一套收支判斷）
+    if re.search(r"(薪資|薪水|工資|月薪|獎金|利息收入|投資收入|兼職收入|收到紅包|收入|入帳|進帳|退款|退費|股息|配息|補助|津貼)", s):
         return "收入"
     # 「繳卡費」是支出：代表實際把款項付出去。
     if "交卡費" in s or "繳卡費" in s or "繳信用卡" in s:
@@ -1037,9 +1037,13 @@ def delete_latest_stock_record(line_user_id):
         if any(str(cell).strip() for cell in row):
             symbol = row[1] if len(row) > 1 else "未命名股票"
             direction = row[2] if len(row) > 2 else "交易"
-            shares = row[3] if len(row) > 3 else ""
+            quantity = row[3] if len(row) > 3 else ""
+            # 相容舊版錯誤格式「1張 股」：張數保留張，股數保留股，不重複拼接單位。
+            quantity = re.sub(r"\s*股\s*$", "", str(quantity)).strip() if "張" in str(quantity) else str(quantity).strip()
+            if quantity and not re.search(r"(?:股|張)$", quantity):
+                quantity += "股"
             ws.delete_rows(row_num)
-            return f"🗑️ 已刪除股票最後一筆：{direction}｜{symbol}｜{shares} 股"
+            return f"🗑️ 已刪除股票最後一筆：{direction}｜{symbol}｜{quantity}"
     return "股票工作表目前沒有可刪除的交易。"
 
 
@@ -1072,48 +1076,6 @@ def set_setting(line_user_id, field, value):
         conn.execute(f"UPDATE user_settings SET {field}=? WHERE line_user_id=?", (value, line_user_id))
 
 
-def cycle_start(today, statement_day):
-    import calendar
-    this_month_last = calendar.monthrange(today.year, today.month)[1]
-    statement_day = min(max(1, statement_day), this_month_last)
-    if today.day > statement_day:
-        start_day = min(statement_day + 1, this_month_last)
-        return datetime.date(today.year, today.month, start_day)
-    # 上個月結算日隔天為本期起日
-    if today.month == 1:
-        year, month = today.year - 1, 12
-    else:
-        year, month = today.year, today.month - 1
-    last = calendar.monthrange(year, month)[1]
-    prev_statement = min(statement_day, last)
-    if prev_statement >= last:
-        # 上個月的結算日已是該月最後一天，本期從本月 1 日開始。
-        return datetime.date(today.year, today.month, 1)
-    return datetime.date(year, month, prev_statement + 1)
-
-
-def query_people_stats(line_user_id):
-    """顯示個人累積收支、現金／帳戶估算餘額與本期刷卡金額。"""
-    try:
-        records = get_records(line_user_id)
-        settings = get_settings(line_user_id)
-    except Exception as e:
-        return f"📭 無法連接你的試算表：{str(e)[:180]}"
-    total_income = sum(r["金額"] for r in records if r["大項目"] == "收入")
-    total_expense = sum(r["金額"] for r in records if r["大項目"] == "支出")
-    today = now_tw().date()
-    start = cycle_start(today, int(settings["statement_day"]))
-    card_total = sum(r["金額"] for r in records if r["大項目"] == "刷卡"
-                     and r["日期"][:10] and start.isoformat() <= r["日期"][:10] <= today.isoformat())
-    balance = total_income - total_expense
-    return (f"📊 個人財務統計\n\n"
-            f"💵 累積收入：${total_income:,}\n"
-            f"💸 累積支出：${total_expense:,}\n"
-            f"💰 餘額：${balance:,}\n"
-            f"💳 本期已刷：${card_total:,}\n"
-            f"📅 信用卡結算日：每月 {int(settings['statement_day'])} 日")
-
-
 def flex_button(label, action):
     return {"type": "button", "style": "primary", "color": "#2E8B78", "action": action, "height": "sm"}
 
@@ -1139,7 +1101,7 @@ def reply_message(reply_token, text):
 
 
 
-WELCOME_MESSAGE = """歡迎使用記帳小工具，可以輸入說明看使用方式。"""
+WELCOME_MESSAGE = """歡迎使用記帳小工具，可以輸入說明看使用方式"""
 
 HELP_MESSAGE = """小工具可以做到的事🩵
 
@@ -1149,10 +1111,8 @@ HELP_MESSAGE = """小工具可以做到的事🩵
 ・記每月還款：繳貸款 5704、繳卡費 5000
 ・切換外幣模式：先輸入「幣別名稱」後，開始像正常記帳一樣記錄；使用完輸入「新台幣」切回日常使用
 ・忘記沒關係可以補上日期：昨天 午餐 100、10/20 晚餐 150
-・打錯了一般／外幣記錄：刪除（刪掉目前模式下自己最後一筆）
-・刪錯股票交易：刪除股票（刪掉自己最後一筆股票交易）
+・打錯了沒關係：「刪除」可以刪台外幣最新一筆收支；「刪除股票」可以刪股票最新一筆資料
 ・查詢收支：今日／本週／本月
-・看個人帳務統計：統計
 ・打開試算表：帳本
 ・買進股票：買0050 100股 60.8
 ・賣出股票：賣0050 100股 60.8
@@ -1373,7 +1333,7 @@ def handle_event(event):
     # 個人分帳模式：每個 LINE 使用者只能操作映射給自己的試算表。
     if not user_is_linked(line_user_id):
         # 一般閒聊不提示設定錯誤，避免群組洗版；但記帳格式必須明確告知原因，不能靜默忽略。
-        setup_commands = {"今日", "今天", "/今日", "/today", "本週", "本周", "/本週", "本月", "/本月", "/month", "統計", "/統計", "/stats", "刪除", "刪除上一筆", "刪除上一筆記帳", "刪除股票", "刪除股票上一筆", "刪除上一筆股票", "帳本"}
+        setup_commands = {"今日", "今天", "/今日", "/today", "本週", "本周", "/本週", "本月", "/本月", "/month", "刪除", "刪除上一筆", "刪除上一筆記帳", "刪除股票", "刪除股票上一筆", "刪除上一筆股票", "帳本"}
         is_balance_setting = re.match(r"^(錢包餘額|帳戶餘額|信用卡結算日)\s*[:：]?\s*\d+$", text)
         is_stock_like = bool(re.search(r"(?:^|\s)(?:買|賣)\s*[^\s]+\s+\d+(?:,\d{3})*\s*(?:股|張)\s+[\d,.]+\s*$", text))
         is_record_like = bool(re.search(r"\d[\d,]*(?:\.\d+)?\s*(?:元|塊|塊錢)?\s*$", text)) or is_stock_like
@@ -1390,7 +1350,14 @@ def handle_event(event):
             if requested_currency == "TWD":
                 reply_message(reply_token, "✅ 已切回新台幣日常記帳模式。\n接下來的支出會寫入原本的記帳工作表。")
             else:
-                reply_message(reply_token, f"✅ 已切換至 {requested_currency} 外幣記帳模式！\n現在可以開始記錄外幣支出或收入，例如：早餐 100、收入 退款 50。\n接下來會寫入「外幣」工作表，保留你選擇的幣別與原幣金額，不換算新台幣，也不併入台幣統計。\n要切回日常記帳，請單獨輸入「新台幣」。")
+                _, currency_label = detect_currency(text)
+                currency_label = currency_label or CURRENCY_ALIASES.get(requested_currency, [requested_currency])[0]
+                reply_message(
+                    reply_token,
+                    f"✅ 已切換至「{currency_label}」記帳模式！\n"
+                    "現在可以開始記錄外幣支出或收入，記錯也可刪除\n"
+                    "要切回日常記帳，請輸入「新台幣」。"
+                )
         except Exception as e:
             sys.stdout.write(f"[CURRENCY MODE] 切換失敗：{e}\n")
             reply_message(reply_token, f"⚠️ 幣別模式切換失敗，這次沒有切換成功，因此請先不要輸入消費。原因：{str(e)[:180]}")
@@ -1424,8 +1391,8 @@ def handle_event(event):
             amount_label = f"${stock_record['amount']:,.2f}".rstrip("0").rstrip(".")
             price_label = f"${stock_record['price']:,.4f}".rstrip("0").rstrip(".")
             reply_message(reply_token,
-                f"✅ 股票{stock_record['direction']}｜{stock_record['symbol']}｜{stock_record['shares']:,} 股\n"
-                f"成交單價：{price_label}\n成交金額：{amount_label}{date_note}\n📒 已寫入「{stock_destination['worksheet']}」工作表（未含手續費與交易稅）")
+                f"✅ 股票{stock_record['direction']}｜{stock_record['symbol']}｜{stock_record['quantity_display']}\n"
+                f"成交單價：{price_label}\n成交金額：{amount_label}")
         except Exception as e:
             sys.stdout.write(f"[STOCK SHEETS] 寫入失敗：{e}\n")
             reply_message(reply_token, f"⚠️ 股票交易沒有成功寫入，請稍後再試。原因：{str(e)[:180]}")
@@ -1442,9 +1409,6 @@ def handle_event(event):
         "本月": lambda: query_stats(line_user_id, "month"),
         "/本月": lambda: query_stats(line_user_id, "month"),
         "/month": lambda: query_stats(line_user_id, "month"),
-        "統計": lambda: query_people_stats(line_user_id),
-        "/統計": lambda: query_people_stats(line_user_id),
-        "/stats": lambda: query_people_stats(line_user_id),
     }
     if text in commands:
         reply_message(reply_token, commands[text]())
