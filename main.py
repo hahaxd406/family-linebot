@@ -51,6 +51,7 @@ PERSONAL_SHEETS = {
             "foreign_currency": "外幣",
         },
     },
+    # 第三位朋友：主要工作表未指定時，程式會依 LINE 顯示名稱自動建立／取得。
     "U5ff9728b5d981070890d63b610a7b834": {
         "spreadsheet_id": "1JegFHHQfZ5nV3WlL0dRrVAwbVlP8-t9mFFLn2a0WR20",
         "main_worksheet": "帳本",
@@ -97,7 +98,7 @@ MAIN_TYPES = ["支出", "收入", "刷卡"]
 # ======================== 小分類編輯區結束 ========================
 
 HEADERS = ["日期", "時間", "記錄人", "收支", "項目", "內容", "金額", "備註"]
-STOCK_HEADERS = ["日期", "股票代號／名稱", "買賣方向", "股數", "成交單價", "成交金額", "備註"]
+STOCK_HEADERS = ["日期", "股票代號", "買賣", "張/股數", "成交單價", "成交成本", "備註"]
 FOREIGN_HEADERS = ["日期", "時間", "記錄人", "收支", "項目", "內容", "幣別", "金額", "備註"]
 
 
@@ -1148,7 +1149,8 @@ HELP_MESSAGE = """小工具可以做到的事🩵
 ・記每月還款：繳貸款 5704、繳卡費 5000
 ・切換外幣模式：先輸入「幣別名稱」後，開始像正常記帳一樣記錄；使用完輸入「新台幣」切回日常使用
 ・忘記沒關係可以補上日期：昨天 午餐 100、10/20 晚餐 150
-・打錯了沒關係：「刪除」，可以刪台外幣最新一筆收支；「刪除股票」，可以刪除股票記錄
+・打錯了一般／外幣記錄：刪除（刪掉目前模式下自己最後一筆）
+・刪錯股票交易：刪除股票（刪掉自己最後一筆股票交易）
 ・查詢收支：今日／本週／本月
 ・看個人帳務統計：統計
 ・打開試算表：帳本
@@ -1208,17 +1210,90 @@ def parse_stock_command(text):
         "symbol": symbol,
         "direction": "買進" if action == "買" else "賣出",
         "shares": shares,
+        "quantity_display": f"{quantity:,}{unit}",
         "price": price,
         "amount": amount,
     }
 
 
 def save_stock_record(line_user_id, record):
-    ws = get_stock_sheet(line_user_id)
-    ws.append_row([
-        record["date"], record["symbol"], record["direction"], record["shares"],
+    """明確寫入該使用者的 Google 試算表「股票」分頁，並驗證新增結果，避免假成功。"""
+    spreadsheet_id = get_user_spreadsheet_id(line_user_id)
+    if not spreadsheet_id:
+        raise RuntimeError("找不到這位使用者對應的試算表 ID，股票沒有寫入。")
+
+    # 直接開啟使用者自己的試算表，不依賴主帳本分頁名稱來推算股票分頁。
+    spreadsheet = shared_google_client().open_by_key(spreadsheet_id)
+    worksheet_title = get_user_feature_worksheet_title(line_user_id, "stock", "股票")
+    legacy_stock_titles = ["股票_Bu_506d", "股票_Syuan_abc4"]
+    try:
+        spreadsheet.worksheet(worksheet_title)
+    except gspread.WorksheetNotFound:
+        legacy_stock_titles.extend(
+            tab.title for tab in spreadsheet.worksheets()
+            if tab.title.startswith("股票_") and tab.title not in legacy_stock_titles
+        )
+    ws = get_or_rename_worksheet(
+        spreadsheet, worksheet_title, legacy_stock_titles,
+        2000, len(STOCK_HEADERS), STOCK_HEADERS
+    )
+
+    row_to_write = [
+        record["date"], record["symbol"], record["direction"], record.get("quantity_display", record["shares"]),
         record["price"], record["amount"], ""
-    ], value_input_option="USER_ENTERED")
+    ]
+    sys.stdout.write(
+        f"[STOCK WRITE START] user={line_user_id} "
+        f"spreadsheet_id={spreadsheet_id} spreadsheet_title={spreadsheet.title!r} "
+        f"worksheet={ws.title!r} row={row_to_write!r}\n"
+    )
+
+    # 寫入 Google Sheets；任何 API 例外都會回到錯誤回覆，不會回報成功。
+    result = ws.append_row(
+        row_to_write,
+        value_input_option="USER_ENTERED",
+        insert_data_option="INSERT_ROWS",
+        include_values_in_response=True,
+    )
+    updated_range = ((result or {}).get("updates") or {}).get("updatedRange")
+
+    # 二次確認實際工作表最後一列，避免 API 沒回傳更新範圍時仍回覆「成功」。
+    saved_values = ws.get_all_values()
+    last_row = saved_values[-1] if len(saved_values) > 1 else []
+    expected = [str(v) for v in row_to_write]
+    actual = [str(v).strip() for v in last_row[:len(expected)]]
+    # Google Sheets 可能把 60.0 顯示成 60、把 6080.0 顯示成 6080，數字欄位以數值比較。
+    text_fields_match = len(actual) >= 4 and actual[:4] == expected[:4]
+    numeric_fields_match = False
+    try:
+        numeric_fields_match = (
+            len(actual) >= 6
+            and abs(float(actual[4].replace(",", "")) - float(record["price"])) < 0.000001
+            and abs(float(actual[5].replace(",", "")) - float(record["amount"])) < 0.01
+        )
+    except (ValueError, TypeError):
+        numeric_fields_match = False
+    if not (text_fields_match and numeric_fields_match):
+        sys.stdout.write(
+            f"[STOCK WRITE VERIFY FAILED] user={line_user_id} "
+            f"spreadsheet_id={spreadsheet_id} worksheet={ws.title!r} "
+            f"updated_range={updated_range!r} expected={expected!r} actual={actual!r}\n"
+        )
+        raise RuntimeError(
+            f"Google 試算表未能確認新增資料（試算表：{spreadsheet.title}；工作表：{ws.title}）。"
+        )
+
+    sys.stdout.write(
+        f"[STOCK WRITE VERIFIED] user={line_user_id} "
+        f"spreadsheet_id={spreadsheet_id} spreadsheet_title={spreadsheet.title!r} "
+        f"worksheet={ws.title!r} updated_range={updated_range!r}\n"
+    )
+    return {
+        "spreadsheet_id": spreadsheet_id,
+        "spreadsheet_title": spreadsheet.title,
+        "worksheet": ws.title,
+        "updated_range": updated_range or "已讀回驗證",
+    }
 
 
 def welcome_flex():
@@ -1344,13 +1419,13 @@ def handle_event(event):
     stock_record = parse_stock_command(text)
     if stock_record:
         try:
-            save_stock_record(line_user_id, stock_record)
+            stock_destination = save_stock_record(line_user_id, stock_record)
             date_note = f"\n📅 記錄日期：{stock_record['date']}" if stock_record["date"] != now_tw().date().isoformat() else ""
             amount_label = f"${stock_record['amount']:,.2f}".rstrip("0").rstrip(".")
             price_label = f"${stock_record['price']:,.4f}".rstrip("0").rstrip(".")
             reply_message(reply_token,
                 f"✅ 股票{stock_record['direction']}｜{stock_record['symbol']}｜{stock_record['shares']:,} 股\n"
-                f"成交單價：{price_label}\n成交金額：{amount_label}{date_note}\n📒 已記錄到你的股票工作表（未含手續費與交易稅）")
+                f"成交單價：{price_label}\n成交金額：{amount_label}{date_note}\n📒 已寫入「{stock_destination['worksheet']}」工作表（未含手續費與交易稅）")
         except Exception as e:
             sys.stdout.write(f"[STOCK SHEETS] 寫入失敗：{e}\n")
             reply_message(reply_token, f"⚠️ 股票交易沒有成功寫入，請稍後再試。原因：{str(e)[:180]}")
