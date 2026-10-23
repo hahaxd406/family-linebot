@@ -1439,13 +1439,11 @@ def handle_event(event):
             amount_label = format_foreign_amount(foreign_record["amount"])
             total_label = format_foreign_amount(foreign_total)
             currency = foreign_record["currency"]
-            date_note = f"\n📅 記錄日期：{foreign_record['date']}" if foreign_record["date"] != now_tw().date().isoformat() else ""
             foreign_type = foreign_record.get("main_type", "支出")
             total_title = "本月外幣收入累積" if foreign_type == "收入" else "本月外幣支出累積"
             reply_message(reply_token,
-                f"✅ 外幣{foreign_type}｜{foreign_record['item']} {amount_label} {currency}（{foreign_record['category']}）{date_note}\n"
-                f"📊 {total_title}：{total_label} {currency}\n"
-                "📒 已記錄到「外幣」工作表；只記錄原幣金額，不換算新台幣，也不計入新台幣統計。")
+                f"✅ 外幣{foreign_type}｜{foreign_record['item']} {amount_label} {currency}（{foreign_record['category']}）\n"
+                f"📊 {total_title}：{total_label} {currency}")
             sys.stdout.write(f"[FOREIGN SHEETS] 寫入成功：{foreign_record}\n")
         except Exception as e:
             sys.stdout.write(f"[FOREIGN SHEETS] 寫入失敗：{e}\n")
