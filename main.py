@@ -161,6 +161,8 @@ def init_db():
         conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS wallet_initial_recorded INTEGER NOT NULL DEFAULT 0")
         conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS account_initial_recorded INTEGER NOT NULL DEFAULT 0")
         conn.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS currency_mode TEXT NOT NULL DEFAULT 'TWD'")
+        # 外幣已改為每筆明確指定幣別；清除舊版持續切換模式留下的狀態。
+        conn.execute("UPDATE user_settings SET currency_mode='TWD' WHERE currency_mode IS DISTINCT FROM 'TWD'")
 
 
 
@@ -994,36 +996,61 @@ def query_stats(line_user_id, period):
 
 
 def delete_latest_record(line_user_id):
-    """刪除目前模式對應工作表中自己的最後一筆記錄。"""
-    mode = get_currency_mode(line_user_id)
-    if mode != "TWD":
-        ws = get_foreign_sheet(line_user_id)
-        values = ws.get_all_values()
-        if len(values) <= 1:
-            return "外幣工作表目前沒有可刪除的記錄。"
-        # 外幣欄位：日期、時間、記錄人、收支、項目、內容、幣別、金額、備註
-        for row_num in range(len(values), 1, -1):
-            row = values[row_num - 1]
-            recorder = row[2].strip() if len(row) > 2 else ""
-            if recorder == get_sender_name(line_user_id, {}) or not recorder:
-                item = row[5] if len(row) > 5 else "未命名項目"
-                amount = row[7] if len(row) > 7 else "0"
-                ws.delete_rows(row_num)
-                return f"🗑️ 已刪除外幣最後一筆：{item} {amount}（{mode}）"
-        return "外幣工作表找不到你自己的記錄，沒有刪除任何資料。"
+    """刪除這個帳本中時間最新的一筆收支；不再依賴台幣／外幣切換模式。"""
+    main_ws = get_sheet(line_user_id)
+    foreign_ws = get_foreign_sheet(line_user_id)
+    main_values = main_ws.get_all_values()
+    foreign_values = foreign_ws.get_all_values()
 
-    ws = get_sheet(line_user_id)
-    rows = ws.get_all_records()
-    if not rows:
-        return "目前找不到你新增的記帳資料。"
-    row = rows[-1]
-    sheet_row_number = len(rows) + 1
-    item = str(row.get("內容", "未命名項目"))
-    amount = str(row.get("金額", "0"))
-    main_type = str(row.get("收支", "支出"))
-    ws.delete_rows(sheet_row_number)
+    def row_timestamp(row):
+        date_text = str(row[0]).strip() if len(row) > 0 else ""
+        time_text = str(row[1]).strip() if len(row) > 1 else "00:00:00"
+        try:
+            date_value = datetime.date.fromisoformat(date_text.replace("/", "-"))
+        except ValueError:
+            for fmt in ("%Y/%m/%d", "%m/%d/%Y", "%Y-%m-%d"):
+                try:
+                    date_value = datetime.datetime.strptime(date_text, fmt).date()
+                    break
+                except ValueError:
+                    date_value = None
+            if date_value is None:
+                return datetime.datetime.min
+        try:
+            time_value = datetime.time.fromisoformat(time_text)
+        except ValueError:
+            time_value = datetime.time(0, 0)
+        return datetime.datetime.combine(date_value, time_value)
+
+    candidates = []
+    # 個人帳本只含該使用者的資料；代記時也應刪除被 @ 對象帳本中的最新一筆，
+    # 不以「記錄人」過濾，否則代記者會無法替對方刪除自己剛代記的資料。
+    for row_num in range(2, len(main_values) + 1):
+        row = main_values[row_num - 1]
+        if any(str(cell).strip() for cell in row):
+            candidates.append((row_timestamp(row), "TWD", row_num, row))
+    for row_num in range(2, len(foreign_values) + 1):
+        row = foreign_values[row_num - 1]
+        if any(str(cell).strip() for cell in row):
+            candidates.append((row_timestamp(row), "FOREIGN", row_num, row))
+
+    if not candidates:
+        return "目前找不到可刪除的收支記錄。"
+
+    _timestamp, record_type, row_num, row = max(candidates, key=lambda item: (item[0], item[2]))
+    if record_type == "FOREIGN":
+        item = row[5] if len(row) > 5 else "未命名項目"
+        currency = row[6] if len(row) > 6 else ""
+        amount = row[7] if len(row) > 7 else "0"
+        foreign_ws.delete_rows(row_num)
+        return f"🗑️ 已刪除外幣最後一筆：{item} {amount} {currency}".strip()
+
+    main_type = row[3] if len(row) > 3 else "支出"
+    item = row[5] if len(row) > 5 else (row[4] if len(row) > 4 else "未命名項目")
+    amount = row[6] if len(row) > 6 else "0"
+    main_ws.delete_rows(row_num)
     with db_connect() as conn:
-        conn.execute("DELETE FROM transaction_meta WHERE line_user_id=? AND sheet_row=?", (line_user_id, sheet_row_number))
+        conn.execute("DELETE FROM transaction_meta WHERE line_user_id=? AND sheet_row=?", (line_user_id, row_num))
     return f"🗑️ 已刪除上一筆：{main_type}｜{item} ${amount}"
 
 
@@ -1115,8 +1142,8 @@ HELP_MESSAGE = """小工具可以做到的事🩵
 ・打錯了沒關係：「刪除」可以刪台外幣最新一筆收支；「刪除股票」可以刪股票最新一筆資料
 ・查詢收支：今日／本週／本月
 ・打開試算表：帳本
-・買進股票：買0050 100股 60.8
-・賣出股票：賣0050 100股 60.8
+・買進股票：買0050 100股 60.8（也可輸入：買股票 0050 100股 60.8）
+・賣出股票：賣0050 100股 60.8（也可輸入：賣股票 0050 100股 60.8）
 ・喚醒記帳小工具：醒醒（閒置後可能需要等待約 1～2 分鐘）
 ・提醒對方記帳：提醒
 ・幫朋友記帳：在群組 @朋友 後輸入項目與金額，資料會寫入對方帳本
@@ -1152,8 +1179,10 @@ def get_stock_sheet(line_user_id):
 def parse_stock_command(text):
     """解析買／賣股票；股數可用股或張，1 張按 1000 股換算。"""
     target_date, cleaned = parse_date_hint(text)
+    # 同時接受「買0050」、「買 0050」及「買股票 0050」等自然寫法。
+    # 股票指令會在一般支出解析之前處理，避免被誤判成消費支出。
     match = re.fullmatch(
-        r"\s*(買|賣)\s*([^\s]+)\s+(\d+(?:,\d{3})*|\d+)\s*(股|張)\s+([\d,]+(?:\.\d+)?)\s*",
+        r"\s*(買|賣)\s*(?:股票\s*)?([^\s]+)\s+(\d+(?:,\d{3})*|\d+)\s*(股|張)\s+([\d,]+(?:\.\d+)?)\s*",
         cleaned,
     )
     if not match:
@@ -1327,6 +1356,7 @@ def handle_event(event):
         return
     sender = get_sender_name(actor_user_id, source)
     text, mentioned_user_id, mention_error = extract_mentioned_user(msg)
+    delegated = False
     if mention_error:
         reply_message(reply_token, mention_error)
         return
@@ -1338,12 +1368,19 @@ def handle_event(event):
             reply_message(reply_token, "⚠️ 這位朋友還沒有綁定自己的帳本，這筆沒有記錄。請先完成帳本綁定。")
             return
         else:
-            sys.stdout.write(f"[DELEGATED] actor={actor_user_id} target={mentioned_user_id} text={text!r}\n")
+            delegated = True
             line_user_id = mentioned_user_id
-            sender = f"{sender}（代記）"
+            # 記錄人保留實際發訊息者的 LINE 顯示名稱，不加「代記」字樣。
+            sys.stdout.write(
+                f"[DELEGATED ROUTE] actor={actor_user_id} target={line_user_id} "
+                f"text={text!r} mention_count=1\n"
+            )
     if not text:
         return
-    sys.stdout.write(f"[MSG] {text!r} from {sender} | actor={actor_user_id} | target={line_user_id}\n")
+    sys.stdout.write(
+        f"[MSG] {text!r} from={actor_user_id} target={line_user_id} "
+        f"delegated={delegated}\n"
+    )
 
     # 查詢自己的 LINE userId，方便管理員建立個人試算表對應。
     if text in {"我的ID", "我的ID是什麼", "/myid"}:
@@ -1371,7 +1408,8 @@ def handle_event(event):
                 reply_message(reply_token, "⚠️ 尚未設定你的個人試算表，請私訊管理員確認帳本綁定。")
             else:
                 ws = get_sheet(line_user_id)
-                reply_message(reply_token, f"📒 這是你的帳本：\nhttps://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit#gid={ws.id}")
+                owner_label = "朋友的帳本" if delegated else "你的帳本"
+                reply_message(reply_token, f"📒 這是{owner_label}：\nhttps://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit#gid={ws.id}")
         except Exception as e:
             reply_message(reply_token, f"⚠️ 暫時無法取得帳本連結：{str(e)[:150]}")
         return
