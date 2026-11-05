@@ -823,13 +823,14 @@ def detect_currency(text):
 
 
 def parse_foreign_record(text, active_currency=None):
-    """解析外幣支出或收入；使用者切換幣別後，持續沿用該幣別。"""
+    """解析單筆明確指定幣別的外幣收支；不使用持續切換模式。"""
     target_date, cleaned = parse_date_hint(text)
     detected_currency, _alias = detect_currency(cleaned)
     # 明確提到新台幣時交給一般記帳流程處理。
     if detected_currency == "TWD":
         return None
-    currency = detected_currency if detected_currency else active_currency
+    # 每筆外幣都必須在訊息中明確寫出幣別，避免忘記切回模式而誤記。
+    currency = detected_currency
     if not currency or currency == "TWD":
         return None
 
@@ -1109,7 +1110,7 @@ HELP_MESSAGE = """小工具可以做到的事🩵
 ・記收入：收入 薪水 28000
 ・記刷卡：刷卡 買衣服 890
 ・記每月還款：繳貸款 5704、繳卡費 5000
-・切換外幣模式：先輸入「幣別名稱」後，開始像正常記帳一樣記錄；使用完輸入「新台幣」切回日常使用
+・記外幣：幣別＋項目＋金額，例如美金 午餐 10、人民幣 盲盒 100、日圓 退款 500
 ・忘記沒關係可以補上日期：昨天 午餐 100、10/20 晚餐 150
 ・打錯了沒關係：「刪除」可以刪台外幣最新一筆收支；「刪除股票」可以刪股票最新一筆資料
 ・查詢收支：今日／本週／本月
@@ -1118,6 +1119,7 @@ HELP_MESSAGE = """小工具可以做到的事🩵
 ・賣出股票：賣0050 100股 60.8
 ・喚醒記帳小工具：醒醒（閒置後可能需要等待約 1～2 分鐘）
 ・提醒對方記帳：提醒
+・幫朋友記帳：在群組 @朋友 後輸入項目與金額，資料會寫入對方帳本
 ・看使用說明：說明
 
 ✨記帳小工具，讓記帳變簡單✨"""
@@ -1265,6 +1267,43 @@ def welcome_flex():
     }}
 
 
+def _utf16_slice_to_python_index(value, utf16_offset):
+    """將 LINE mention 的 UTF-16 offset 轉成 Python 字元索引。"""
+    used = 0
+    for index, char in enumerate(value):
+        if used >= utf16_offset:
+            return index
+        used += len(char.encode("utf-16-le")) // 2
+    return len(value)
+
+
+def extract_mentioned_user(message):
+    """回傳 (清除 mention 後的文字, 被 @ 的單一 LINE userId, 錯誤訊息)。"""
+    original = str(message.get("text", ""))
+    mentionees = (message.get("mention") or {}).get("mentionees") or []
+    user_mentions = [m for m in mentionees if m.get("type") == "user" and m.get("userId")]
+    if not user_mentions:
+        return original.strip(), None, None
+    if len(user_mentions) != 1:
+        return original.strip(), None, "一次只能 @ 一位要記帳的朋友，避免資料寫錯人。"
+
+    # LINE 的 index/length 使用 UTF-16 code units；由後往前移除，避免索引位移。
+    cleaned = original
+    ranges = []
+    for mentionee in mentionees:
+        if mentionee.get("type") != "user" or not mentionee.get("userId"):
+            continue
+        start = int(mentionee.get("index", 0))
+        length = int(mentionee.get("length", 0))
+        py_start = _utf16_slice_to_python_index(original, start)
+        py_end = _utf16_slice_to_python_index(original, start + length)
+        ranges.append((py_start, py_end))
+    for start, end in sorted(ranges, reverse=True):
+        cleaned = cleaned[:start] + " " + cleaned[end:]
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t\r\n,，:：")
+    return cleaned, user_mentions[0]["userId"], None
+
+
 def handle_event(event):
     event_type = event.get("type")
     reply_token = event.get("replyToken", "")
@@ -1282,11 +1321,29 @@ def handle_event(event):
     if msg.get("type") != "text":
         return
     text = msg.get("text", "").strip()
+    actor_user_id = line_user_id
     if not line_user_id:
         reply_message(reply_token, "⚠️ 無法辨識你的 LINE 帳號，請重新傳送訊息。")
         return
-    sender = get_sender_name(line_user_id, source)
-    sys.stdout.write(f"[MSG] {text!r} from {sender} | LINE userId={line_user_id}\n")
+    sender = get_sender_name(actor_user_id, source)
+    text, mentioned_user_id, mention_error = extract_mentioned_user(msg)
+    if mention_error:
+        reply_message(reply_token, mention_error)
+        return
+    if mentioned_user_id:
+        if mentioned_user_id == actor_user_id:
+            # @自己沒有代記意義，仍以本人帳本處理。
+            mentioned_user_id = None
+        elif not user_is_linked(mentioned_user_id):
+            reply_message(reply_token, "⚠️ 這位朋友還沒有綁定自己的帳本，這筆沒有記錄。請先完成帳本綁定。")
+            return
+        else:
+            sys.stdout.write(f"[DELEGATED] actor={actor_user_id} target={mentioned_user_id} text={text!r}\n")
+            line_user_id = mentioned_user_id
+            sender = f"{sender}（代記）"
+    if not text:
+        return
+    sys.stdout.write(f"[MSG] {text!r} from {sender} | actor={actor_user_id} | target={line_user_id}\n")
 
     # 查詢自己的 LINE userId，方便管理員建立個人試算表對應。
     if text in {"我的ID", "我的ID是什麼", "/myid"}:
@@ -1324,12 +1381,6 @@ def handle_event(event):
         reply_message(reply_token, HELP_MESSAGE)
         return
 
-    # 先辨識單獨輸入的幣別名稱。若帳號尚未綁定，明確告知原因，不要讓「美金」看起來沒反應。
-    requested_currency = currency_command(text)
-    if requested_currency and not user_is_linked(line_user_id):
-        reply_message(reply_token, "⚠️ 這個 LINE 帳號尚未完成個人試算表／資料庫設定，幣別模式沒有切換。請先完成帳號綁定後再試。")
-        return
-
     # 個人分帳模式：每個 LINE 使用者只能操作映射給自己的試算表。
     if not user_is_linked(line_user_id):
         # 一般閒聊不提示設定錯誤，避免群組洗版；但記帳格式必須明確告知原因，不能靜默忽略。
@@ -1340,27 +1391,6 @@ def handle_event(event):
         if text in setup_commands or is_balance_setting or is_record_like:
             sys.stdout.write("[CONFIG] 未記帳：個人試算表映射、GOOGLE_CREDENTIALS_JSON 或 DATABASE_URL 未完整設定\n")
             reply_message(reply_token, "⚠️ 這個 LINE 帳號還沒有綁定個人試算表，這筆尚未記錄。請私訊管理員提供「我的ID」，完成 USER_SPREADSHEET_MAP 設定後再試。")
-        return
-
-    # 幣別模式切換：狀態按 LINE 使用者分開保存，重啟服務後仍會延續。
-    # 切換失敗時明確回覆錯誤，避免使用者以為已切換，後續卻誤記到新台幣帳本。
-    if requested_currency:
-        try:
-            set_currency_mode(line_user_id, requested_currency)
-            if requested_currency == "TWD":
-                reply_message(reply_token, "✅ 已切回新台幣日常記帳模式。\n接下來的支出會寫入原本的記帳工作表。")
-            else:
-                _, currency_label = detect_currency(text)
-                currency_label = currency_label or CURRENCY_ALIASES.get(requested_currency, [requested_currency])[0]
-                reply_message(
-                    reply_token,
-                    f"✅ 已切換至「{currency_label}」記帳模式！\n"
-                    "現在可以開始記錄外幣支出或收入，記錯也可刪除\n"
-                    "要切回日常記帳，請輸入「新台幣」。"
-                )
-        except Exception as e:
-            sys.stdout.write(f"[CURRENCY MODE] 切換失敗：{e}\n")
-            reply_message(reply_token, f"⚠️ 幣別模式切換失敗，這次沒有切換成功，因此請先不要輸入消費。原因：{str(e)[:180]}")
         return
 
     setting_match = re.fullmatch(r"(錢包餘額|帳戶餘額|信用卡結算日)\s*[:：]?\s*(\d+)", text)
@@ -1431,8 +1461,7 @@ def handle_event(event):
         return
 
     # 明確提到非新台幣幣別時，獨立寫入「外幣」，不納入新台幣帳本統計。
-    current_currency_mode = get_currency_mode(line_user_id)
-    foreign_record = parse_foreign_record(text, active_currency=current_currency_mode if current_currency_mode != "TWD" else None)
+    foreign_record = parse_foreign_record(text)
     if foreign_record:
         try:
             foreign_total = save_foreign_record(line_user_id, sender, foreign_record)
@@ -1450,19 +1479,11 @@ def handle_event(event):
             reply_message(reply_token, f"⚠️ 外幣記錄沒有成功寫入，請稍後再試。原因：{str(e)[:180]}")
         return
 
-    # 外幣模式下若有金額卻無法解析，禁止掉回新台幣帳本，避免誤記到一般支出表。
-    explicit_currency_for_safety, _ = detect_currency(text)
-    if current_currency_mode != "TWD" and explicit_currency_for_safety != "TWD" and re.search(r"\d[\d,]*(?:\.\d+)?\s*(?:元|塊|塊錢)?\s*$", text):
-        reply_message(reply_token, "⚠️ 目前仍在外幣記帳模式，但這筆格式我無法辨識，所以沒有寫入任何工作表。請試試「早餐 100」或「昨天 拉麵 1200」；要記新台幣請先輸入「新台幣」。")
-        return
-
     payment_method = "bank"
     parse_text = text
-    # 使用者在外幣模式中明確寫出新台幣，也視為結束外幣模式；若同句有消費，照常記入新台幣帳本。
+    # 明確寫出新台幣時，移除幣別字樣後沿用一般台幣記帳流程。
     explicit_currency, _explicit_alias = detect_currency(parse_text)
     if explicit_currency == "TWD":
-        if current_currency_mode != "TWD":
-            set_currency_mode(line_user_id, "TWD")
         for alias in sorted(CURRENCY_ALIASES["TWD"], key=len, reverse=True):
             parse_text = re.sub(rf"(?<![A-Za-z]){re.escape(alias)}(?![A-Za-z])" if alias.isascii() else re.escape(alias), " ", parse_text, flags=re.I)
         parse_text = re.sub(r"\s+", " ", parse_text).strip()
